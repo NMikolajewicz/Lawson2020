@@ -1,0 +1,301 @@
+---
+title: "Sunbeam Plot"
+output: html_document
+---
+
+```{r load libraries, include=FALSE}
+
+# clear global enviroment                          
+rm(list = ls())
+
+# # load packages
+library(dplyr)
+library(pheatmap)
+library(ggplot2)
+library(ggrepel)
+
+```
+
+
+```{r}
+
+# input files
+file.list <- list(
+  S15 = list(file = "Table_S15_Fitm2 IFN screen_DrugZ.xlsx",
+              sheet.1 = "WT-IFNg-End",
+              sheet.2 = "Fitm2-IFNg-End"),
+  S17 = list(file = "Table_S17_Fitm2_GI_data.xlsx",
+              sheet.1 = "result_table_diffGI_data_CTL_en",
+              sheet.2 = "result_table_diffGI_data_IFN_en"),
+  S18 = list(file = "Table_S18_Atg12 TNF screen.xlsx",
+              sheet.1 = "WT-TNF-End",
+              sheet.2 = "Atg12-TNF-End"),
+  S19 = list(file = "Table_S19_Atg12_GI_data.xlsx",
+              sheet.1 = "result_table_diffGI_data_CTL_en",
+              sheet.2 = "result_table_diffGI_data_TNF_en")
+)
+
+# specify input
+which.input <- "S17"
+file <- file.list[[which.input]][["file"]]
+sheet.1 <- file.list[[which.input]][["sheet.1"]]
+sheet.2 <- file.list[[which.input]][["sheet.2"]]
+
+# import data
+df.1 <- readxl::read_excel(file, sheet.1)
+df.2 <- readxl::read_excel(file, sheet.2)
+
+
+```
+
+```{r merge and prep data}
+
+# merge
+df.all <- merge(df.1, df.2, by = "GENE")
+
+# log transform of FDR
+if (which.input %in% c("S18", "S15")){
+  df.all$fdr.x <- -log10(pmin(df.all$fdr_synth.x, df.all$fdr_supp.x))
+  df.all$fdr.y <- -log10(pmin(df.all$fdr_synth.y, df.all$fdr_supp.y))
+  
+} else if (which.input %in% c("S17", "S19")){
+  
+  df.all$fdr_synth.x <- df.all$fdr.x
+  df.all$fdr_supp.x <- df.all$fdr.x
+  
+  df.all$fdr_synth.y <- df.all$fdr.y
+  df.all$fdr_supp.y <- df.all$fdr.y
+  
+  df.all$fdr.x <- -log10(df.all$fdr.x)
+  df.all$fdr.y <- -log10(df.all$fdr.y)  
+  
+  df.all$normZ.x <- df.all$z.x
+  df.all$normZ.y <- df.all$z.y
+  
+}
+
+# euclidean dist to origin
+df.all$log.euc.xy <- sqrt((df.all$fdr.x^2) + (df.all$fdr.y^2))
+
+df.all <- df.all[complete.cases(df.all), ]
+
+```
+
+
+```{r define sectors}
+
+ax.lim <- 50
+
+# sector 1
+df.q1 <- data.frame(y = seq(0, ax.lim, 0.01))
+df.q1$x1 <- df.q1$y /  tan((22.5+45) / (180/pi))
+df.q1$x2 <- df.q1$y /   tan((22.5+45+45) / (180/pi))
+
+# sector 2
+df.q2 <- data.frame(x = seq(0, ax.lim, 0.01))
+df.q2$y1 <- df.q2$x *  tan((22.5) / (180/pi))
+df.q2$y2 <- df.q2$x *   tan((22.5+45) / (180/pi))
+
+# sector 3
+df.q3 <- data.frame(x = seq(0, ax.lim, 0.01))
+df.q3$y1 <- df.q3$x *  tan((22.5) / (180/pi))
+df.q3$y2 <- df.q3$x *   tan((22.5+45+45 + 45) / (180/pi))
+
+# sector 4
+df.q4 <- data.frame(x = seq(0, ax.lim, 0.01))
+df.q4$y1 <- df.q4$x *  tan((22.5+45+45) / (180/pi))
+df.q4$y2 <- df.q4$x *   tan((22.5+45+45 + 45) / (180/pi))
+
+# sector 5
+df.q5 <- data.frame(y = seq(-ax.lim,0 , 0.01))
+df.q5$x1 <- df.q5$y /  tan((22.5+45+45) / (180/pi))
+df.q5$x2 <- df.q5$y /   tan((22.5+45) / (180/pi))
+
+# sector 6
+df.q6 <- data.frame(x = seq(-ax.lim, 0, 0.01))
+df.q6$y1 <- df.q6$x *  tan((22.5) / (180/pi))
+df.q6$y2 <- df.q6$x *   tan((22.5+45) / (180/pi))
+
+
+# sector 7
+df.q7 <- data.frame(x = seq(-ax.lim, 0, 0.01))
+df.q7$y1 <- df.q7$x *  tan((22.5) / (180/pi))
+df.q7$y2 <- df.q7$x *   tan((22.5+45+45 + 45) / (180/pi))
+
+# sector 8
+df.q8 <- data.frame(x = seq(-ax.lim, 0, 0.01))
+df.q8$y1 <- df.q8$x *  tan((22.5+45+45) / (180/pi))
+df.q8$y2 <- df.q8$x *   tan((22.5+45+45 + 45) / (180/pi))
+
+```
+
+
+```{r ellipses thresholds}
+
+
+fdr.threshold <- 0.05
+
+df.x.min <- df.all %>% filter(fdr_synth.x < fdr.threshold, normZ.x < 0 ) 
+x.lo <- max(df.x.min$normZ.x)
+
+df.x.max <- df.all %>% filter(fdr_supp.x < fdr.threshold, normZ.x > 0 ) 
+x.hi <- min(df.x.max$normZ.x)
+
+df.y.min <- df.all %>% filter(fdr_synth.y < fdr.threshold, normZ.y < 0 ) 
+y.lo <- max(df.y.min$normZ.y)
+
+df.y.max <- df.all %>% filter(fdr_supp.y < fdr.threshold, normZ.y > 0  )
+y.hi <- min(df.y.max$normZ.y)
+
+# # calculate ellipses
+stat.eclip <- stat_ellipse(level =0.999, linetype = 2)
+cur.facet <- paste0(sheet.1,"-", sheet.2)
+plotData <- ggplot(df.all, aes(normZ.x, normZ.y)) + geom_point() + stat.eclip
+build <- ggplot_build(plotData)$data
+points <- build[[1]]
+ell <- build[[2]]
+
+# rescale ellipses
+ell$x.norm <- ell$x
+ell$x.norm[ell$x > 0] <- ell$x.norm[ell$x > 0] / max(ell$x.norm[ell$x > 0])
+ell$x.norm[ell$x > 0] <- ell$x.norm[ell$x > 0] * x.hi
+ell$x.norm[ell$x < 0] <- (ell$x.norm[ell$x < 0] / min(ell$x.norm[ell$x < 0]))
+ell$x.norm[ell$x < 0] <- ell$x.norm[ell$x < 0] * x.lo
+
+ell$y.norm <- ell$y
+ell$y.norm[ell$y > 0] <- ell$y.norm[ell$y > 0] / max(ell$y.norm[ell$y > 0])
+ell$y.norm[ell$y > 0] <- ell$y.norm[ell$y > 0] * y.hi
+ell$y.norm[ell$y < 0] <- (ell$y.norm[ell$y < 0] / min(ell$y.norm[ell$y < 0]))
+ell$y.norm[ell$y < 0] <- ell$y.norm[ell$y < 0] * y.lo
+
+
+```
+
+```{r helper function to rescale values}
+
+rescaleValues <- function(values, new.min = 0, new.max = 1){
+
+  # set lower bound to zero
+  old.min <- min(values)
+  if (old.min < 0) {
+    values <- values + abs(old.min)
+  } else if (old.min > 0) {
+    values <- values - abs(old.min)
+  }
+  stopifnot( min(values) == 0)
+
+  # set upper bound to one
+  old.max <- (max(values))
+  values <- values/old.max
+  stopifnot( max(values) == 1)
+
+  new.range <- new.max - new.min
+  values <- values * new.range
+  values <- values + new.min
+
+  stopifnot(min(values) == new.min)
+  stopifnot(max(values) == new.max)
+
+  return(values)
+
+}
+
+```
+
+```{r generate plot, fig.width = 6, fig.height = 6}
+
+# # plot range
+min.x <- min(df.all$normZ.x) * 1.1
+max.x <- max(df.all$normZ.x) * 1.1
+min.y <- min(df.all$normZ.y) * 1.1
+max.y <- max(df.all$normZ.y) * 1.1
+# 
+# # flag points that are outside of ellipses threshold
+df.inout <- data.frame(df.all$normZ.x,  df.all$normZ.y,
+                       in.ell = as.logical(sp::point.in.polygon(df.all$normZ.x,
+                                                                df.all$normZ.y,
+                                                                ell$x.norm,
+                                                                ell$y.norm)))
+outside <- which(df.inout$in.ell == FALSE)
+df.all$in_ellipsoid <- rep(FALSE, dim(df.all)[1])
+df.all$in_ellipsoid[outside] <- TRUE
+
+# # get labels
+top.n.labels <- 50
+top.genes <- (df.all %>% top_n(top.n.labels, log.euc.xy))$GENE
+df.all$label <- ""
+df.all$label[df.all$GENE %in% top.genes] <- df.all$GENE[df.all$GENE %in% top.genes]
+df.all$label[is.na(df.all$label)] <- ""
+
+
+```
+
+```{r}
+
+# specify colors
+cytokine.color <- "slategray"
+ctl.color <- "tan"
+cytokine.alpha <- 0.10
+ctl.alpha <-  0.20
+
+# get italicized labels
+top.n.labels <- 30
+top.genes <- (df.all %>% top_n(top.n.labels, log.euc.xy))$GENE
+df.all$label <- ""
+df.all$label[df.all$GENE %in% top.genes] <- paste0("italic('", df.all$GENE[df.all$GENE %in% top.genes], "')")
+df.label <- df.all[!is.na(df.all$label) & df.all$label != "", ]
+
+# scale points (needs some tinkering to get nice asthetics)
+df.all$log.euc.xy <- sqrt((df.all$normZ.y ^2) + (df.all$normZ.x ^2))
+df.all$log.euc.recale <- df.all$log.euc.xy
+df.all$log.euc.recale[!df.all$in_ellipsoid] <- min(df.all$log.euc.recale[df.all$in_ellipsoid])
+df.all$log.euc.recale <- rescaleValues((df.all$log.euc.recale), 0.0001, 100)
+df.all$log.euc.recale <- df.all$log.euc.recale - 15
+df.all$log.euc.recale[df.all$log.euc.recale < 0] <- 0.0001
+
+# plt.floral.sector <- 
+ggplot( data = df.all ) +
+  geom_ribbon(data = df.q1, aes(y = y, xmin = x1, xmax = x2), alpha = cytokine.alpha, fill = cytokine.color) + 
+  geom_ribbon(data = df.q2, aes(x = x, ymin = y1, ymax = y2), alpha = 1, fill = "#FCCC00") + 
+  geom_ribbon(data = df.q3, aes(x = x, ymin = y1, ymax = y2), alpha = ctl.alpha, fill = ctl.color) +
+  geom_ribbon(data = df.q4, aes(x = x, ymin = y1, ymax = y2), alpha = 1, fill = "white") + 
+  geom_ribbon(data = df.q5, aes(y = y, xmin = x1, xmax = x2), alpha = cytokine.alpha, fill = cytokine.color) + 
+  geom_ribbon(data = df.q6, aes(x = x, ymin = y1, ymax = y2), alpha = 1, fill = "#00AEEF") + 
+  geom_ribbon(data = df.q7, aes(x = x, ymin = y1, ymax = y2), alpha = ctl.alpha, fill = ctl.color) + 
+  geom_ribbon(data = df.q8, aes(x = x, ymin = y1, ymax = y2), alpha = 1, fill = "white") + 
+    geom_hline(yintercept = 0, color = "grey", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "grey", linetype = "dashed") +
+  geom_abline(slope =1 , color = "grey", linetype = "dashed") +
+  geom_abline(slope = -1, color = "grey", linetype = "dashed") +
+  geom_point( aes(x=normZ.x, y=normZ.y),shape=20,size=0.1,colour="lightgrey" ) +
+    geom_point( data=subset( df.all,in_ellipsoid ),
+              aes(x=normZ.x,y=normZ.y,size=log.euc.recale),pch=21,colour="black",fill="lightgrey" ) + 
+  ggConvexHull::geom_convexhull (data = ell, aes(x = x.norm, y = y.norm), color = "black", alpha = 0, linetype = "dashed") + 
+  geom_text_repel(data = df.label, aes(x = normZ.x, y = normZ.y, label =label), size = 3, parse = TRUE) + 
+  labs( title = "Fitm2 - CTL Tx - End-point" ) + 
+  xlab("WT (NormZ)") +
+  ylab("Fitm2 (NormZ)") +
+  theme(legend.position = "none",
+        panel.grid.major =element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "#FFFFFF", colour = "black",size = 1, linetype = "solid"),
+        panel.border = element_rect(colour = "black", fill=NA, size=1),
+        axis.text.x = element_text( color="black",size=12,angle=0,hjust=1),
+        axis.text.y = element_text( color="black",size=12),
+        axis.title = element_text( color="black",size=14,face="bold"),
+        plot.title = element_text( size=16, face="bold", hjust=0.5 )) + 
+  coord_cartesian(xlim = c(min.x, max.x), ylim = c(min.y, max.y)) +
+    xlab(sheet.1) + 
+  ylab(sheet.2) + 
+  ggtitle(file)
+
+# ggsave( "D:/Users/Nick/Dropbox/CTL_paper/Revised Manuscript/New figures/New data/Nick/Figure Updates/S17_v2.pdf",plot=last_plot(),width=5,height=5,bg="transparent",dpi=300,useDingbats=F)
+
+
+
+```
+
+
+
+
+

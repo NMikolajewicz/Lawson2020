@@ -1,0 +1,930 @@
+---
+title: "In vivo mouse data analysis"
+author: "Catherine Ross"
+date: "June 24, 2020"
+output:
+  html_document:
+    toc: true
+  pdf_document:
+    toc: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+library(knitr)
+pdf.options(useDingbats = FALSE)
+opts_chunk$set(echo = TRUE, fig.show = "hold", cache = TRUE, dev = c("png", "pdf"))
+```
+
+# Set up workspace
+## Load packages
+
+```{r, loadPackages, message = FALSE, warning = FALSE}
+library(openxlsx)
+library(reshape2)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(RColorBrewer)
+```
+
+## Define I/O
+
+```{r, defineIO}
+# In vivo data
+info_file   <- "input/sample_info/samples_list_KL.xlsx"
+rc_file     <- "input/readcounts/MUS018 EMT6-HA In Vivo Validation - 20200320 - readcounts.txt"
+rc_val_file <- "input/readcounts/MUS014 EMT6-HA Validation - 20190409 - readcounts.txt"
+
+# In vitro data
+class_file   <- "input/library_annotations/Core_MeanNormZ.txt"
+control_file <- "input/library_annotations/mVal_gene_list.txt"
+bf_file      <- "input/library_annotations/bftable_all.txt"
+
+# Create output folder
+output_folder <- "output/inVivoAnalysis"
+if (!dir.exists(output_folder)) { dir.create(output_folder) }
+```
+
+## Parameter setting
+
+```{r, parameterSetting}
+# Set special hard-coded column names
+special_cols <- c("CHROMOSOME", "START", "STOP", "STRAND", "SEQUENCE", "GENE")
+
+# Experimental control genes
+control_genes <- c("luciferase", "LacZ", "EGFP")
+
+# Timepoint groups
+timepoints <- c("Early", "Late")
+```
+
+## Define functions
+
+```{r, Rfunctions}
+# Log2 depth-normalize readcounts (KB)
+normalizeReads <- function(data) {
+  log2((sweep(data, 2, apply(data, 2, sum)/1000000, FUN = "/")) + 0.1)
+}
+
+# Detect outliers via PCA
+# The standard way to detect outliers in genetics is the criterion of being
+# “more than 6 standard deviations away from the mean”
+# https://privefl.github.io/blog/detecting-outlier-samples-in-pca/
+pcaOutlier <- function(df) {
+  p_out <- apply(df, 2, function(x) which((abs(x - median(x)) / mad(x)) > 6)) %>% Reduce(union, .)
+  return(p_out)
+}
+
+# Detect outliers in boxplots
+boxOutlier <- function(x) {
+  b_out <- x < quantile(x, 0.25) - 1.5 * IQR(x) | x > quantile(x, 0.75) + 1.5 * IQR(x)
+  return(b_out)
+}
+```
+
+# Prepare data
+## Read inputs
+
+```{r, readData}
+# Library sample info
+info <- read.xlsx(info_file)
+
+# NOTE aggregating mid+late timepoint groups (now labelled "Late")
+info$Group <- gsub("Mid", "Late", info$Group)
+
+# In vivo readcounts
+rc <- read.delim(rc_file, h = TRUE, stringsAsFactors = FALSE)
+
+# In vitro readcounts
+rc_val  <- read.delim(rc_val_file, h = TRUE, stringsAsFactors = FALSE)
+
+# Subset in vivo library for those in validation library
+rc <- rc[which(rc$SEQUENCE %in% rc_val$SEQUENCE),]
+
+# In vitro bayes factor data
+bf <- read.delim(bf_file, h = TRUE, stringsAsFactors = FALSE)
+
+# Library annotation files
+classes <- read.delim(class_file, h = TRUE, stringsAsFactors = FALSE)
+controls <- read.delim(control_file, h = TRUE, stringsAsFactors = FALSE)
+
+cat(paste("Total samples: ", ncol(rc), "\n"))
+cat(paste("Total library: ", nrow(rc), "\n"))
+```
+
+## Prepare mValidation library annotations
+
+```{r, prepGeneAnno}
+# Complete validation library
+gene_lib <- data.frame(GENE = unique(rc$GENE))
+
+# Define suppressors and sensitizers using EMT6 parental line
+## > 0 = supp; < 0 = sens
+classes2 <- classes[,c("GENE", "EMT6")]
+classes2 <- na.omit(classes2)
+classes2$CLASS <- NA
+classes2[which(classes2$EMT6 > 0), "CLASS"] <- "Suppressor"
+classes2[which(classes2$EMT6 < 0), "CLASS"] <- "Sensitizer"
+classes3 <- classes2[,-which(colnames(classes2) %in% c("EMT6"))]
+
+# Controls category file
+controls2 <- controls[,-which(colnames(controls) %in% c("Core", "Intergenic"))]
+colnames(controls2) <- c("Targeting_control", "Non_targeting_control", "Other_control")
+
+# Melt to tidy frame
+controls_melt <- melt(controls2, measure.vars = colnames(controls2))
+
+# Remove empty values
+controls_melt[which(controls_melt$value == ""),] <- NA
+controls_melt <- na.omit(controls_melt)
+colnames(controls_melt) <- c("CLASS", "GENE")
+
+# Fix gene names for indexing
+controls_melt$GENE[controls_melt$GENE == "Luciferase"] <- "luciferase"
+controls_melt$GENE[controls_melt$GENE == "CD274"] <- "Cd274"
+controls_melt$GENE[controls_melt$GENE == "CD47"] <- "Cd47"
+controls_melt <- controls_melt[,c("GENE", "CLASS")]
+
+# Combine sens/supp + control dfs together
+all_classes <- rbind(classes3, controls_melt)
+
+# Merge with gene_lib df
+gene_lib <- left_join(gene_lib, all_classes, by = "GENE")
+
+# Define genes without scores in EMT6 parental line as "Non_hit"
+gene_lib[which(is.na(gene_lib$CLASS)), "CLASS"] <- "Non_hit"
+```
+
+## Define essentials
+
+```{r, defineEssentials}
+# Essential genes - bayes factor > 50 in EMT6 parental line
+bf_em <- bf[,c("GENE", "EMT6.HA_T11")]
+bf_em_ess <- bf_em[which(bf_em[, "EMT6.HA_T11"] > 50), "GENE"]
+cat(paste("Number of essential genes:", length(bf_em_ess), "\n"))
+
+# Add essentiality info to gene_lib df
+gene_lib[which(gene_lib$GENE %in% bf_em_ess), "CLASS"] <- paste(gene_lib[which(gene_lib$GENE %in% bf_em_ess), "CLASS"], "(essential)")
+
+# Define factor levels
+class_levels <- c("Suppressor (essential)", "Suppressor",
+                  "Sensitizer (essential)", "Sensitizer",
+                  "Non_hit (essential)", "Non_hit",
+                  "Targeting_control", "Non_targeting_control", "Other_control")
+
+# Define factor level colours
+class_cols <- c("#F6EB13", "#999206", "#6D90CA", "#425A80",
+                "#e62525", "#751d1d", "#C0BFBF", "forestgreen","black")                  
+```
+
+## Sample labels
+
+```{r, sampleLabels}
+# Generate sample labels
+groups <- info$Group
+groups[grep("T", groups)] <- paste0(groups[grep("T", groups)], "_control")
+replicates <- info$Replicate
+conditions <- gsub(" ", "-", info$Condition)
+
+# Put info together
+labels <- paste(conditions, replicates, sep = "-")
+labels <- paste(labels, groups, sep = "_")
+labels[1:4] <- c("T0_control", "T6-A_control", "T6-B_control", "T6-C_control")
+labels_df <- data.frame(sample = info$Sample, label = labels)
+labels_df$label <- as.character(labels_df$label)
+
+# Rename readcount sample labels
+for (col in (length(special_cols)+1):ncol(rc)) {
+  sample <- labels_df[which(labels_df$sample %in% colnames(rc)[col]), "label"]
+  colnames(rc)[col] <- sample
+}
+
+# Merge T6 columns
+rc[,"T6_control"] <- rowMeans(rc[,grep("T6", colnames(rc))], na.rm = TRUE)
+```
+
+## T6-normalized T0
+
+```{r, T6normT0}
+# Define sample columns
+t0_col <- "T0_control"
+t6_col <- "T6_control"
+
+# Recode missing values to 0
+rc[is.na(rc)] <- 0
+
+# Normalize T0 to T6 inputs
+rc[,"T0-T6_control"] <- rc[[t0_col]] - rc[[t6_col]]
+
+# Clean and re-order columns
+rc2 <- rc[,-grep("^T6-|In-vitro", colnames(rc))]
+rc2 <- rc2[,c(seq_along(special_cols), 7, 186, 187, 8:185)]
+
+# Define additional sample columns
+t0_t6_col <- "T0-T6_control"
+control_cols <- c(t0_col, t6_col, "T0-T6_control")
+balb_cols <- grep("BALB", colnames(rc2), value = TRUE)
+nsg_cols <- grep("NSG", colnames(rc2), value = TRUE)
+
+cat(paste("Total Balb-c samples:", length(balb_cols), "\n"))
+cat(paste("Total NSG samples:", length(nsg_cols), "\n"))
+```
+
+# Data QC
+## Readcount depth
+
+```{r, rcDepth}
+# Check total readcount depth
+cat(paste("T0 total reads:", sum(rc2[[t0_col]]), "\n"))
+cat(paste("T6 total reads:", sum(rc2[[t6_col]]), "\n"))
+
+# Check readcount depth for all samples
+for (col in nsg_cols) {
+  total_reads <- sum(rc2[[col]])
+  cat(paste(col, "total reads:", total_reads, "\n"))
+}
+for (col in balb_cols) {
+  total_reads <- sum(rc2[[col]])
+  cat(paste(col, "total reads:", total_reads, "\n"))
+}
+```
+
+## Chromosome representation
+
+```{r, chromRep, fig.width = 8, fig.height = 8}
+# Get number of reads per chromosome divided by number of guides
+chrom_stats <- rc2[!(rc2$GENE %in% control_genes),] %>%
+  group_by(CHROMOSOME) %>%
+  summarise(total_reads = sum(!!as.name(col)), n = n(), .groups = "keep")
+
+chrom_stats <- chrom_stats[order(chrom_stats$n, decreasing = TRUE),]
+chrom_stats$adj_reads <- chrom_stats$total_reads / chrom_stats$n
+
+# Set factor levels
+chrom_stats$CHROMOSOME <- factor(chrom_stats$CHROMOSOME, levels = rev(chrom_stats$CHROMOSOME))
+
+# Plot
+ggplot(chrom_stats, aes(x = CHROMOSOME, y = adj_reads), position_stack(reverse = TRUE)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  xlab("Chromosome") +
+  ylab("Adjusted total reads") +
+  theme_bw(base_size = 8)
+```
+
+# Data processing
+## Readcount normalization
+
+```{r, dataProcessing}
+# Filter guides by t0 abundance
+lower_threshold <- 40
+upper_threshold <- 1e5
+to_remove <- rep(FALSE, nrow(rc2))
+to_remove[rc2[[t0_col]] < lower_threshold | rc2[[t0_col]] > upper_threshold] <- TRUE
+
+# Normalize readcounts to sequencing depth
+rc2_norm <- rc2
+rc2_norm[!(colnames(rc2_norm) %in% special_cols)] <- normalizeReads(rc2_norm[!(colnames(rc2_norm) %in% special_cols)])
+
+# Remove guides that did not pass T0 readcount thresholds
+# Must be performed after read-depth normalization
+removed_guides_ind <- which(to_remove)
+rc2_norm <- rc2_norm[!to_remove,]
+cat(paste("Excluded a total of", sum(to_remove), "guides for T0 representation\n"))
+```
+
+## PCA
+
+```{r, pca}
+# Prepare normalized reads for computing
+rc2_t_norm <- t(rc2_norm[!(colnames(rc2_norm) %in% special_cols)])
+
+# PCA analysis with prcomp
+rc2_pca_norm <- prcomp(rc2_t_norm)
+
+# Prepare for plotting
+rc2_pca_norm_df <- as.data.frame(rc2_pca_norm$x)
+rc2_pca_norm_df$label <- rownames(rc2_pca_norm_df)
+rownames(rc2_pca_norm_df) <- NULL
+
+# Further separate out sample labels
+rc2_pca_norm_df2 <- separate(rc2_pca_norm_df, col = label, into = c("sample", "group"), sep = "_")
+
+# Group into NSG / BALB sets
+rc2_pca_norm_nsg <- rc2_pca_norm_df2[grep("NSG", rc2_pca_norm_df2$sample),]
+rc2_pca_norm_nsg$group <- factor(rc2_pca_norm_nsg$group, levels = timepoints)
+rc2_pca_norm_nsg$outlier <- "No"
+rc2_pca_norm_balb <- rc2_pca_norm_df2[grep("BALB", rc2_pca_norm_df2$sample),]
+rc2_pca_norm_balb$group <- factor(rc2_pca_norm_balb$group, levels = timepoints)
+rc2_pca_norm_balb$outlier <- "No"
+
+# Measure outlier-ness among each group of mice (eg NSG early, BALBc early, etc)
+for (set in timepoints) {
+  # NSG set
+  nsg_set <- which(rc2_pca_norm_nsg$group == set)
+  nsg_outliers <- pcaOutlier(rc2_pca_norm_nsg[nsg_set,1:2])
+  rc2_pca_norm_nsg[nsg_set,][nsg_outliers, "outlier"] <- "Yes"
+  # BALBc set
+  balb_set <- which(rc2_pca_norm_balb$group == set)
+  balb_outliers <- pcaOutlier(rc2_pca_norm_balb[balb_set,1:2])
+  rc2_pca_norm_balb[balb_set,][balb_outliers, "outlier"] <- "Yes"
+}
+
+# List of sample outliers
+nsg_outliers <- rc2_pca_norm_nsg[which(rc2_pca_norm_nsg$outlier == "Yes"), "sample"]
+balb_outliers <- rc2_pca_norm_balb[which(rc2_pca_norm_balb$outlier == "Yes"), "sample"]
+sample_outliers <- c(nsg_outliers, balb_outliers)
+
+# Write out table
+table_out <- paste0(output_folder, "/list_pca_normReads_sample_outliers_NSG_BALB.txt")
+#write.table(sample_outliers, file = table_out)
+```
+
+### NSG
+
+```{r, pca_NSG, fig.width = 15, fig.height = 5}
+ggplot(rc2_pca_norm_nsg, aes(x = PC1, y = PC2, colour = outlier, label = sample)) +
+  facet_wrap(. ~ group, scales = "free") +
+  geom_point() +
+  geom_text(size = 3, vjust = "inward", hjust = "inward") +
+  scale_colour_manual(values = c("black", "red")) +
+  theme_bw(base_size = 8) +
+  theme(legend.position = "bottom")
+```
+
+### Balb-c
+
+```{r, pca_BalbC, fig.width = 15, fig.height = 5}
+ggplot(rc2_pca_norm_balb, aes(x = PC1, y = PC2, colour = outlier, label = sample)) +
+  facet_wrap(. ~ group, scales = "free") +
+  geom_point() +
+  geom_text(size = 3, vjust = "inward", hjust = "inward") +
+  scale_colour_manual(values = c("black", "red")) +
+  theme_bw(base_size = 8) +
+  theme(legend.position = "bottom")
+```
+
+## Log2-normalized reads
+### NSG
+
+```{r, log2normReads_NSG, fig.width = 20, fig.height = 5}
+rc2_norm_nsg <- rc2_norm[which(colnames(rc2_norm) %in% c("GENE", "SEQUENCE", control_cols, nsg_cols))]
+rc2_norm_nsg <- melt(rc2_norm_nsg, id.vars = c("SEQUENCE", "GENE"))
+rc2_norm_nsg <- separate(rc2_norm_nsg, col = variable, into = c("sample", "group"), sep = "_")
+rc2_norm_nsg$group <- factor(rc2_norm_nsg$group, levels = c("control", timepoints))
+rc2_norm_nsg <- left_join(rc2_norm_nsg, gene_lib, by = "GENE")
+rc2_norm_nsg$CLASS <- factor(rc2_norm_nsg$CLASS, levels = class_levels)
+
+# Sample level gene mean
+rc2_norm_nsg_mean <-
+  rc2_norm_nsg %>%
+  group_by(sample) %>%
+  summarise(mean = median(value), .groups = "keep") %>%
+  as.data.frame()
+
+# Order
+rc2_norm_nsg_mean <- rc2_norm_nsg_mean[order(rc2_norm_nsg_mean$mean),]
+rc2_norm_nsg$sample <- factor(rc2_norm_nsg$sample, levels = rc2_norm_nsg_mean$sample)
+
+# Plot
+ggplot(rc2_norm_nsg, aes(x = sample, y = value)) +
+  facet_grid(. ~ group, scales = "free_x", space = "free_x") +
+  geom_boxplot() +
+  labs(y = "Log2-normalized readcounts", x = "Mouse sample") +
+  theme_bw(base_size = 8) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+### Balb-c
+
+```{r, log2normReads_BalbC, fig.width = 20, fig.height = 5}
+rc2_norm_balb <- rc2_norm[which(colnames(rc2_norm) %in% c("GENE", "SEQUENCE", control_cols, balb_cols))]
+rc2_norm_balb <- melt(rc2_norm_balb, id.vars = c("SEQUENCE", "GENE"))
+rc2_norm_balb <- separate(rc2_norm_balb, col = variable, into = c("sample", "group"), sep = "_")
+rc2_norm_balb$group <- factor(rc2_norm_balb$group, levels = c("control", timepoints))
+rc2_norm_balb <- left_join(rc2_norm_balb, gene_lib, by = "GENE")
+rc2_norm_balb$CLASS <- factor(rc2_norm_balb$CLASS, levels = class_levels)
+
+# Sample level gene mean
+rc2_norm_balb_mean <-
+  rc2_norm_balb %>%
+  group_by(sample) %>%
+  summarise(mean = median(value), .groups = "keep") %>%
+  as.data.frame()
+
+# Order
+rc2_norm_balb_mean <- rc2_norm_balb_mean[order(rc2_norm_balb_mean$mean),]
+rc2_norm_balb$sample <- factor(rc2_norm_balb$sample, levels = rc2_norm_balb_mean$sample)
+
+# Plot
+ggplot(rc2_norm_balb, aes(x = sample, y = value)) +
+  facet_grid(. ~ group, scales = "free_x", space = "free_x") +
+  geom_boxplot() +
+  labs(y = "Log2-normalized readcounts", x = "Mouse sample") +
+  theme_bw(base_size = 8) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+# Foldchange analysis
+## Log2-foldchange calculation
+
+```{r, log2FC}
+# Calculate log2 foldchange
+rc2_norm_t0 <- rc2_norm[[t0_col]]
+rc2_lfc <- rc2_norm
+rc2_lfc[!(colnames(rc2_lfc) %in% special_cols)] <- rc2_lfc[!(colnames(rc2_lfc) %in% special_cols)] - rc2_norm_t0
+```
+
+### NSG
+
+```{r, log2FC_NSG, fig.width = 20, fig.height = 5}
+# Subset for NSG/control columns
+rc2_lfc_nsg <- rc2_lfc[which(colnames(rc2_lfc) %in% c("GENE", "SEQUENCE", nsg_cols))]
+
+# Separate 'variable' column to extract timepoint groups
+rc2_lfc_nsg2 <- melt(rc2_lfc_nsg, id.vars = c("SEQUENCE", "GENE"))
+rc2_lfc_nsg2 <- separate(rc2_lfc_nsg2, col = variable, into = c("sample", "group"), sep = "_")
+rc2_lfc_nsg2$group <- factor(rc2_lfc_nsg2$group, levels = c("control", timepoints))
+rc2_lfc_nsg2 <- left_join(rc2_lfc_nsg2, gene_lib, by = "GENE")
+rc2_lfc_nsg2$CLASS <- factor(rc2_lfc_nsg2$CLASS, levels = class_levels)
+
+# Get means
+rc2_lfc_nsg_mean <-
+  rc2_lfc_nsg2 %>%
+  group_by(GENE, group, sample) %>%
+  summarise(mean = mean(value), .groups = "keep") %>%
+  as.data.frame()
+
+# Add mean data to lfc data
+rc2_lfc_nsg3 <- left_join(rc2_lfc_nsg2, rc2_lfc_nsg_mean, by = c("GENE", "sample", "group"))
+
+# Plot
+ggplot(rc2_lfc_nsg3, aes(x = sample, y = value)) +
+  facet_grid(. ~ group, scales = "free_x", space = "free_x") +
+  geom_boxplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "green") +
+  labs(y = "Log2 foldchange", x = "Mouse sample") +
+  theme_bw(base_size = 8) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+### Balb-c
+
+```{r, log2FC_BalbC, fig.width = 20, fig.height = 5}
+# Subset for BALBC/control columns
+rc2_lfc_balb <- rc2_lfc[which(colnames(rc2_lfc) %in% c("GENE", "SEQUENCE", balb_cols))]
+
+# Separate 'variable' column to extract timepoint groups
+rc2_lfc_balb2 <- melt(rc2_lfc_balb, id.vars = c("SEQUENCE", "GENE"))
+rc2_lfc_balb2 <- separate(rc2_lfc_balb2, col = variable, into = c("sample", "group"), sep = "_")
+rc2_lfc_balb2$group <- factor(rc2_lfc_balb2$group, levels = c("control", timepoints))
+rc2_lfc_balb2 <- left_join(rc2_lfc_balb2, gene_lib, by = "GENE")
+rc2_lfc_balb2$CLASS <- factor(rc2_lfc_balb2$CLASS, levels = class_levels)
+
+# Get means
+rc2_lfc_balb_mean <-
+  rc2_lfc_balb2 %>%
+  group_by(GENE, group, sample) %>%
+  summarise(mean = mean(value), .groups = "keep") %>%
+  as.data.frame()
+
+# Add mean data to lfc data
+rc2_lfc_balb3 <- left_join(rc2_lfc_balb2, rc2_lfc_balb_mean, by = c("GENE", "sample", "group"))
+
+# Plot
+ggplot(rc2_lfc_balb3, aes(x = sample, y = value)) +
+  facet_grid(. ~ group, scales = "free_x", space = "free_x") +
+  geom_boxplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "green") +
+  labs(y = "Log2 foldchange", x = "Mouse sample") +
+  theme_bw(base_size = 8) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+## T6-normalized log2-foldchange calculation
+
+```{r, T6log2FC}
+# Calculate log2 foldchange using T6-normalized T0
+rc2_norm_t0_t6 <- rc2_norm[[t0_t6_col]]
+rc3_lfc <- rc2_norm
+rc3_lfc[!(colnames(rc3_lfc) %in% special_cols)] <- rc3_lfc[!(colnames(rc3_lfc) %in% special_cols)] - rc2_norm_t0_t6
+```
+
+### NSG
+
+```{r, T6log2FC_NSG, fig.width = 20, fig.height = 5}
+# Subset for NSG/control columns
+rc3_lfc_nsg <- rc3_lfc[which(colnames(rc3_lfc) %in% c("GENE", "SEQUENCE", nsg_cols))]
+
+# Separate 'variable' column to extract timepoint groups
+rc3_lfc_nsg2 <- melt(rc3_lfc_nsg, id.vars = c("SEQUENCE", "GENE"))
+rc3_lfc_nsg2 <- separate(rc3_lfc_nsg2, col = variable, into = c("sample", "group"), sep = "_")
+rc3_lfc_nsg2$group <- factor(rc3_lfc_nsg2$group, levels = c("control", timepoints))
+rc3_lfc_nsg2 <- left_join(rc3_lfc_nsg2, gene_lib, by = "GENE")
+rc3_lfc_nsg2$CLASS <- factor(rc3_lfc_nsg2$CLASS, levels = class_levels)
+
+# Get means
+rc3_lfc_nsg_mean <-
+  rc3_lfc_nsg2 %>%
+  group_by(GENE, group, sample) %>%
+  summarise(mean = mean(value), .groups = "keep") %>%
+  as.data.frame()
+
+# Add mean data to lfc data
+rc3_lfc_nsg3 <- left_join(rc3_lfc_nsg2, rc3_lfc_nsg_mean, by = c("GENE", "sample", "group"))
+
+# Plot
+ggplot(rc3_lfc_nsg3, aes(x = sample, y = value)) +
+  facet_grid(. ~ group, scales = "free_x", space = "free_x") +
+  geom_boxplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "green") +
+  labs(y = "Log2 foldchange", x = "Mouse sample") +
+  theme_bw(base_size = 8) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+### Balb-c
+
+```{r, T6log2FC_BalbC, fig.width = 20, fig.height = 5}
+# Subset for BALBC/control columns
+rc3_lfc_balb <- rc3_lfc[which(colnames(rc3_lfc) %in% c("GENE", "SEQUENCE", balb_cols))]
+
+# Separate 'variable' column to extract timepoint groups
+rc3_lfc_balb2 <- melt(rc3_lfc_balb, id.vars = c("SEQUENCE", "GENE"))
+rc3_lfc_balb2 <- separate(rc3_lfc_balb2, col = variable, into = c("sample", "group"), sep = "_")
+rc3_lfc_balb2$group <- factor(rc3_lfc_balb2$group, levels = c("control", timepoints))
+rc3_lfc_balb2 <- left_join(rc3_lfc_balb2, gene_lib, by = "GENE")
+rc3_lfc_balb2$CLASS <- factor(rc3_lfc_balb2$CLASS, levels = class_levels)
+
+# Get means
+rc3_lfc_balb_mean <-
+  rc3_lfc_balb2 %>%
+  group_by(GENE, group, sample) %>%
+  summarise(mean = mean(value), .groups = "keep") %>%
+  as.data.frame()
+
+# Add mean data to lfc data
+rc3_lfc_balb3 <- left_join(rc3_lfc_balb2, rc3_lfc_balb_mean, by = c("GENE", "sample", "group"))
+
+# Plot
+ggplot(rc3_lfc_balb3, aes(x = sample, y = value)) +
+  facet_grid(. ~ group, scales = "free_x", space = "free_x") +
+  geom_boxplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "green") +
+  labs(y = "Log2 foldchange", x = "Mouse sample") +
+  theme_bw(base_size = 8) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+# Differential log2-foldchange analysis
+## Sample level
+
+```{r, dLFC_sample}
+# Construct df
+rc3_lfc_diff <- data.frame(
+  GENE = rc3_lfc_balb2$GENE,
+  SEQUENCE = rc3_lfc_balb2$SEQUENCE,
+  group = rc3_lfc_balb2$group,
+  sample = rc3_lfc_balb2$sample,
+  LFC_diff = rc3_lfc_balb2$value
+)
+
+# Mean LFC of NSG samples
+rc3_lfc_nsg_mean <-
+  rc3_lfc_nsg3 %>%
+  group_by(GENE, group) %>%
+  summarise(nsg_mean = mean(mean), .groups = "keep") %>%
+  as.data.frame()
+
+# Mean LFC of NSG samples
+rc3_lfc_balb_mean <-
+  rc3_lfc_balb3 %>%
+  group_by(GENE, group) %>%
+  summarise(balb_mean = mean(mean), .groups = "keep") %>%
+  as.data.frame()
+
+# Subtract BALBc LFC - mean NSG LFC
+for (set in unique(rc3_lfc_diff$group)) {
+  for (gene in unique(rc3_lfc_diff$GENE)) {
+    nsg_mean_set <- rc3_lfc_nsg_mean[which(rc3_lfc_nsg_mean$group == set & rc3_lfc_nsg_mean$GENE == gene), "nsg_mean"]
+    rc3_lfc_diff[which(rc3_lfc_diff$group == set & rc3_lfc_diff$GENE == gene), "LFC_diff"] <-
+      (rc3_lfc_diff[which(rc3_lfc_diff$group == set & rc3_lfc_diff$GENE == gene), "LFC_diff"] - nsg_mean_set)
+  }
+}
+
+# Get gene-level means per sample
+gene_means <-
+  rc3_lfc_diff %>%
+  group_by(GENE, sample) %>%
+  summarise(gene_mean = mean(LFC_diff), .groups = "keep") %>%
+  as.data.frame()
+
+# Join
+rc3_lfc_diff2 <- left_join(rc3_lfc_diff, gene_means, by = c("GENE", "sample"))
+```
+
+## Timepoint level
+
+```{r, dLFC_timepoint}
+# Sequence-level mean of sample diff LFC per timepoint group (aggregating samples)
+rc3_lfc_diff_mean <-
+  rc3_lfc_diff %>%
+  group_by(GENE, SEQUENCE, group) %>%
+  summarise(mean = mean(LFC_diff), sd = sd(LFC_diff), .groups = "keep") %>%
+  as.data.frame()
+
+# Get gene-level means per group
+gene_means2 <-
+  rc3_lfc_diff_mean %>%
+  group_by(GENE, group) %>%
+  summarise(gene_mean = mean(mean), .groups = "keep") %>%
+  as.data.frame()
+
+# Join
+rc3_lfc_diff_mean2 <- left_join(rc3_lfc_diff_mean, gene_means2, by = c("GENE", "group"))
+
+# Get mean of non-targeting controls at each timepoint group
+control_means2 <-
+  rc3_lfc_diff_mean2 %>%
+  filter(GENE == "luciferase" | GENE == "EGFP" | GENE == "LacZ") %>%
+  group_by(group) %>%
+  summarise(control_mean = mean(mean), .groups = "keep")
+```
+
+# Gene annotation
+
+```{r, geneAnnotation, fig.width = 12, fig.height = 5}
+# Sample level
+rc3_lfc_diff3 <- left_join(rc3_lfc_diff2, gene_lib, by = "GENE")
+rc3_lfc_diff3$CLASS <- factor(rc3_lfc_diff3$CLASS, levels = class_levels)
+
+# Gene group level
+rc3_lfc_diff_mean3 <- left_join(rc3_lfc_diff_mean2, gene_lib, by = "GENE")
+rc3_lfc_diff_mean3$CLASS <- factor(rc3_lfc_diff_mean3$CLASS, levels = class_levels)
+
+# Define outliers, if present
+rc3_lfc_diff_mean3 <-
+  rc3_lfc_diff_mean3 %>%
+  group_by(group, CLASS) %>%
+  mutate(outlier = ifelse(boxOutlier(gene_mean), GENE, NA)) %>%
+  as.data.frame()
+
+# Label outliers, if present
+rc3_lfc_diff_mean3[!is.na(rc3_lfc_diff_mean3$outlier), "outlier"] <- as.character(rc3_lfc_diff_mean3[!is.na(rc3_lfc_diff_mean3$outlier), "GENE"])
+
+# Plot
+ggplot(rc3_lfc_diff_mean3, aes(x = CLASS, y = gene_mean, fill = CLASS)) +
+  facet_wrap(. ~ group, scales = "free") +
+  geom_boxplot() +
+  geom_text(aes(label = outlier), na.rm = TRUE, nudge_y = 0.1, nudge_x = 0.5) +
+  geom_hline(data = control_means2, aes(yintercept = control_mean), colour = "green", linetype = "dashed") +
+  labs(y = "Differential log2 foldchange\n(normalized to T6)") +
+  theme_bw(base_size = 8) +
+  scale_fill_manual(values = class_cols) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        legend.position = "bottom",
+        legend.title = element_blank())
+```
+
+# Supplemental tables
+
+```{r, sTables}
+# Join mean BALB LFC + mean NSG LFC dfs
+rc3_lfc_bn_mean <- left_join(rc3_lfc_balb_mean, rc3_lfc_nsg_mean, by = c("GENE", "group"))
+rc3_lfc_bn_mean$deltaLFC <- rc3_lfc_bn_mean$balb_mean - rc3_lfc_bn_mean$nsg_mean
+rc3_lfc_bn_mean$pval <- NULL
+rc3_lfc_bn_mean$fdr <- NULL
+
+# Init list to store p value data
+pval_list <- list()
+
+# Get p values
+for (set in timepoints) {
+
+  # Separate by time point group
+  rc3_set <- filter(rc3_lfc_diff_mean3, group == set)
+  rc3_set_control <- filter(rc3_set, CLASS == "Targeting_control")
+
+  # Get p values
+  pvals <- data.frame(GENE = unique(rc3_set$GENE), pval = NA, fdr = NA)
+  for (i in pvals$GENE) {
+    gene_i <- filter(rc3_set, GENE == i)
+    pval <- wilcox.test(gene_i$mean, rc3_set_control$mean, alternative = "l")$p.value
+    pvals[which(pvals$GENE == i), "pval"] <- pval
+  }
+
+  # FDR correct pvalues
+  pvals <- pvals[order(pvals$pval),]
+  pvals$fdr <- p.adjust(pvals$pval, method = "BH")
+  pvals$fdr <- signif(pvals$fdr, 1)
+
+  # Write out to list
+  pval_list[[set]] <- pvals
+}
+
+# Separate data by timepoint group
+## Early
+early <- filter(rc3_lfc_bn_mean, group == "Early")
+early <- early[,-2]
+early <- left_join(early, pval_list[["Early"]], by = "GENE")
+colnames(early) <- c("Gene", "Mean LFC BALB-C (early)", "Mean LFC NSG (early)", "DeltaLFC (early)", "Pvalue (early)", "FDR (early)")
+
+## Late
+late <- filter(rc3_lfc_bn_mean, group == "Late")
+late <- late[,-2]
+late <- left_join(late, pval_list[["Late"]], by = "GENE")
+colnames(late) <- c("Gene", "Mean LFC BALB-C (late)", "Mean LFC NSG (late)", "DeltaLFC (late)", "Pvalue (late)", "FDR (late)")
+
+# Combine together
+rc3_lfc_bn_mean2 <- left_join(early, late, by = "Gene")
+
+# Write out
+stable_out <- paste0(output_folder, "/table_summary_gene_mean_LFC_BALBC_NSG_pwilcox_less.xlsx")
+write.xlsx(rc3_lfc_bn_mean2, file = stable_out, row.names = FALSE)
+```
+
+# Main plots
+
+```{r, plot_densityRug}
+# Grab positive control data
+control_dlfc_all <- filter(rc3_lfc_diff_mean3, CLASS == "Targeting_control")
+
+# Grab all library genes (for p value calculation)
+all_genes <- unique(rc3_lfc_diff_mean3$GENE)
+
+# Function to generate plots
+## set (character) Early or Late timepoint group
+## gene (character) gene of interest to generate plot (e.g., Atg, Fitm2)
+## width (integer) width of graphics region (inches)
+## height (integer) height of graphics region (inches)
+plotDensityRug <- function(set, gene, width, height) {
+
+  # Define genes of interest to plot
+  if (gene == "Atg") {
+    gene_levels <- c("Atg3", "Atg7", "Atg5", "Atg10", "Atg9a", "Atg101", "Atg12",
+                     "Atg14", "EGFP", "LacZ", "luciferase", "Controls")
+  } else if (gene == "Fitm2") {
+    gene_levels <- c("Fitm2", "EGFP", "LacZ", "luciferase", "Controls")
+  } else if (gene == "Socs1") {
+    gene_levels <- c("Socs1", "EGFP", "LacZ", "luciferase", "Controls")
+  } else if (gene == "Suppressors") {
+    gene_levels <- c("B2m", "Tap1", "Tap2", "Tapbp", "Jak1", "Jak2", "Stat1", "Stat2",
+                     "Ifngr1", "Ifngr2", "EGFP", "LacZ", "luciferase", "Controls")
+  } else if (gene == "other") {
+    gene_levels <- c("Vdac2", "Ptpn2", "EGFP", "LacZ", "luciferase", "Controls")
+  } else {
+    cat(paste("Error: gene", gene, "not currently supported to plot\n"))
+    return(NULL)
+  }
+
+  # Remove "Controls" from gene levels
+  gene_levels2 <- gene_levels[-length(gene_levels)]
+
+  # Plot data
+  plot_data <- filter(rc3_lfc_diff_mean3, group == set)
+
+  # Control data
+  control_dlfc <- filter(plot_data, CLASS == "Targeting_control")
+  control_dlfc$GENE <- "Controls"
+
+  # Gene data
+  gene_dlfc <- plot_data[grep(paste(gene_levels2, collapse = "|"), plot_data$GENE),]
+  gene_dlfc$GENE <- factor(gene_dlfc$GENE, levels = gene_levels2)
+
+  # Combine data
+  dlfc <- gene_dlfc
+  for (i in gene_levels2) {
+    control_dlfc_i <- control_dlfc
+    control_dlfc_i[which(control_dlfc_i$GENE == "Controls"), "GENE"] <- i
+    dlfc <- rbind(dlfc, control_dlfc_i)
+  }
+
+  # Significance values
+  pvals <- data.frame(GENE = all_genes, pval = NA, fdr = NA)
+  for (i in pvals$GENE) {
+    gene_i <- filter(plot_data, GENE == i)
+    pval <- wilcox.test(gene_i$mean, control_dlfc$mean, alternative = "l")$p.value
+    pvals[which(pvals$GENE == i), "pval"] <- pval
+  }
+
+  # FDR correct p values
+  pvals <- pvals[order(pvals$pval),]
+  pvals$fdr <- p.adjust(pvals$pval, method = "BH")
+  pvals$fdr <- signif(pvals$fdr, 1)
+
+  # Subset for genes of interest
+  pvals <- pvals[which(pvals$GENE %in% dlfc$GENE),]
+
+  # Order pval df
+  pvals <- pvals[order(match(pvals$GENE, gene_levels2)),]
+
+  # Set factor levels
+  pvals$GENE <- factor(pvals$GENE, levels = gene_levels2)
+  dlfc$GENE <- factor(dlfc$GENE, levels = gene_levels2)
+
+  # Group colours
+  cols <- brewer.pal(8, "Set1")
+  cols <- cols[c(3,2)]
+
+  # Median per group
+  plot_means <- control_dlfc_all %>%
+    group_by(group) %>%
+    summarise(group_mean = mean(gene_mean), .groups = "keep")
+
+  # Set x axis limits
+  xlims = c(-14, 6)
+
+  # Density plot of control dLFC
+  p1 <- ggplot(control_dlfc_all, aes(x = mean, colour = group, fill = group)) +
+          geom_density(bw = 0.5, alpha = 0.5) +
+          theme_classic(base_size = 5) +
+          scale_colour_manual(values = cols) +
+          scale_fill_manual(values = cols) +
+          scale_x_continuous(limits = c(xlims[1], xlims[2]), breaks = seq(xlims[1], xlims[2], by = 2)) +
+          labs(y = "Density", x = expression(paste(Delta, " log"[2], "(foldchange)"))) +
+          geom_vline(data = plot_means[which(plot_means$group==set),], aes(xintercept = group_mean), size = 0.3, colour = "black", linetype = "dashed") +
+          theme(legend.position = c(1.05, 0.7),
+                legend.title = element_blank(),
+                legend.text = element_text(size = 5/1.2),
+                legend.key.size = unit(0.25, "line"),
+                panel.grid = element_blank())
+
+  # Set colour of rug plot
+  if (set == "Early") { col_set <- cols[1] }
+  if (set == "Late")  { col_set <- cols[2] }
+
+  # Rug plot
+  p2 <- ggplot(gene_dlfc, aes(x = mean, colour = CLASS)) +
+          facet_grid(GENE ~ ., switch = "y") +
+          theme_bw(base_size = 5) +
+          scale_x_continuous(limits = c(xlims[1], xlims[2]), breaks = seq(xlims[1], xlims[2], by = 2)) +
+          geom_rug(data = subset(dlfc, CLASS == "Targeting_control"), alpha = 0.1, col = "grey70", size = 0.7, length = unit(1, "npc")) +
+          geom_rug(data = subset(dlfc, CLASS == "Non_targeting_control"), alpha = 1, col = col_set, size = 0.7, length = unit(1, "npc")) +
+          geom_rug(data = subset(dlfc, CLASS != "Targeting_control" & CLASS != "Non_targeting_control"), alpha = 1, col = col_set, size = 0.7, length = unit(1, "npc")) +
+          geom_vline(data = plot_means[which(plot_means$group==set),], aes(xintercept = group_mean), size = 0.3, colour = "black", linetype = "dashed") +
+          theme(strip.text.y.left = element_text(angle = 0, face = "italic"),
+                strip.background = element_rect(fill = "grey20", color = "grey20", size = 1),
+                strip.text = element_text(colour = "white"),
+                axis.title.x = element_blank(),
+                axis.text.x = element_blank(),
+                axis.ticks.x = element_blank(),
+                axis.line.x = element_blank(),
+                axis.line.y = element_blank(),
+                panel.grid = element_blank(),
+                legend.title = element_blank(),
+                legend.position = "none")
+
+  # Grab significance values
+  gene_labs <- as.character(pvals$fdr)
+  names(gene_labs) <- pvals$GENE
+
+  # Plot p values
+  p3 <- ggplot(pvals) +
+          theme_minimal(base_size = 5) +
+          facet_grid(GENE~., labeller = labeller(GENE = gene_labs)) +
+          theme(strip.text.y.right = element_text(angle = 0, hjust = 0))
+
+  # Draw out
+  plot_out <- sprintf("%s/plot_densityRug_posControlDist_guides%s_dlog2FC_all_%s_pwilcox.pdf", output_folder, gene, set)
+  pdf(plot_out, width = width, height = height, useDingbats = FALSE)
+
+  # Align density to rug plot
+  left <- plot_grid(p1, p2, labels = NULL, ncol = 1, align = "v", axis = "bl", rel_heights = c(2, 3))
+
+  # Align rug to FDR plot
+  right <- plot_grid(NULL, p3, ncol = 1, rel_heights = c(2, 3))
+
+  # Put together
+  print(plot_grid(left, right, ncol = 2, rel_widths = c(7, 0.8)))
+
+  # Shut off plot device
+  dev.off()
+
+  # Write out dLFC table
+  table_plot <- gene_dlfc
+  table_plot <- table_plot[order(table_plot$GENE, table_plot$mean),]
+
+  # Write out
+  table_out <- sprintf("%s/table_guides%s_dlog2FC_all_%s_pwilcox_v7.xlsx", output_folder, gene, set)
+  invisible(capture.output(write.xlsx(table_plot, file = table_out, row.names = FALSE)))
+}
+```
+
+```{r, run_plotDensityRug, message = FALSE, warning = FALSE}
+# Call function on various genes of interest
+invisible(mapply(plotDensityRug, timepoints, "Atg", width = 2, height = 3))
+invisible(mapply(plotDensityRug, timepoints, "Suppressors", width = 2, height = 3.5))
+invisible(mapply(plotDensityRug, timepoints, "Socs1", width = 2, height = 2))
+invisible(mapply(plotDensityRug, timepoints, "Fitm2", width = 2, height = 2))
+invisible(mapply(plotDensityRug, timepoints, "other", width = 2, height = 2))
+```
+
+# End of code
+
+```{r, endVignette}
+sessionInfo()
+```

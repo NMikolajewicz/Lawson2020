@@ -1,0 +1,978 @@
+---
+title: "In vivo analysis"
+output: html_document
+---
+
+```{r load libraries, include=FALSE}
+
+# clear global enviroment                          
+rm(list = ls())
+
+# load packages
+library(ggplot2)
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(ggrepel)
+library(topGO)
+library(fgsea)
+library(org.Mm.eg.db)
+```
+
+
+```{r import and prep data}
+
+# pool duplicates
+pool.duplicates <- T
+
+# specify directory and file name
+directory <- "D:/Users/Nick/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/Nick/scRNAseq/Results/EMT6 invivo screen/EMT6screen_Analysis_NM/inputData/"
+file <- "totalReads_v2_020420.txt"
+import_set_path <- paste(directory, file, sep ="")
+
+# import count matrix
+expression_matrix<-read.table(import_set_path[1],header=TRUE)
+
+
+# specify whether matrix should be pooled
+if (pool.duplicates){
+  expression_matrix[is.na(expression_matrix)] <- 0
+} else {
+  expression_matrix[is.na(expression_matrix)] <- -1
+}
+
+if (pool.duplicates){
+  
+  # get gene names
+  feature.names <- as.vector(expression_matrix$GENE)
+  
+  # average duplicate gRNA
+  if (length(unique(feature.names)) < length(feature.names)){
+    expression_matrix.col <- expression_matrix
+    expression_matrix.col <- dplyr::select(expression_matrix.col, -c("GENE"))
+    expression_matrix.col$rowID <- seq(1, nrow(expression_matrix.col))
+    expression_matrix.col.noDup <-  WGCNA::collapseRows(expression_matrix.col, 
+                                                        rowGroup = expression_matrix$GENE, 
+                                                        rowID = expression_matrix.col$rowID, 
+                                                        method = "Average")
+    new.mat <- as.data.frame(expression_matrix.col.noDup[["datETcollapsed"]])
+    new.mat <- dplyr::select(new.mat, -c("rowID"))
+    new.mat$GENE <- rownames(new.mat)
+    expression_matrix2 <- new.mat
+  } else {
+    # assign to secondary matrix
+    expression_matrix2 <- expression_matrix
+  }
+  
+} else {
+  
+  # get gene names
+  original.features <- as.vector(expression_matrix$GENE)
+  
+  expression_matrix$GENE <- paste0(expression_matrix$GENE, "-", seq(1, nrow(expression_matrix)))
+  expression_matrix2 <- expression_matrix
+}
+
+feature.names <- as.vector(expression_matrix2$GENE)
+
+expression_matrix2 <- dplyr::select(expression_matrix2, -c("GENE"))
+rownames(expression_matrix2) <- feature.names
+
+# assign organism
+orgs <- rep("Mm",ncol(expression_matrix2));
+names(orgs) <- colnames(expression_matrix2);
+
+
+# create seurat object
+# Seurat is used to help manage some of single-cell-like workflow. Used out of convenience, not necessity. 
+so = CreateSeuratObject(counts = expression_matrix2,project= "EMT6_invivoScreen",min.cells=0,min.features=0)
+
+# Add in inferred organism
+so$Organism <- orgs;
+
+# Specify barcodes
+so$Barcode <- "unspecified";
+
+so.query <- so
+
+```
+
+
+```{r assign sample and mval library annotations to count meta data}
+
+# specify location of sample info
+sample.info <- paste(directory, "samples_list_KL.xlsx",sep = "")
+
+# import sample info
+df.info <- readxl::read_excel(sample.info)
+df.info$sample.id <- df.info$Sample
+
+# get count meta data
+df.meta <- so.query@meta.data
+df.meta$sample.id <- rownames(df.meta)
+
+# assign sample infot to count meta data
+df.merge <- merge(df.meta, df.info)
+rownames(df.merge) <- df.merge$sample.id
+cell.id <- colnames(so.query)
+df.merge <- df.merge[match(cell.id, df.merge$sample.id), ]
+so.query@meta.data <- df.merge
+
+# specify location of mval info
+mVal.info <- paste(directory, "mVal_gene_list.txt",sep = "")
+
+# import mval info
+df.mVal<-read.delim2(mVal.info,header=TRUE)
+
+```
+
+
+```{r mapping function}
+
+# helper functions used to relabel and subset samples
+mapSubsetSeurat <- function(so, old.field, new.field, mapping.list){
+  
+  keep.this <- NULL
+  for (i in 1:length(mapping.list)){
+    
+    cur.group <- names(mapping.list)[order(names(mapping.list))][i]
+    cur.pattern <- (mapping.list)[order(names(mapping.list))][[i]]
+    
+    if (is.null(keep.this)){
+      keep.this <- grepl(cur.pattern, so@meta.data[[old.field]])
+    } else {
+      keep.this <- (keep.this | grepl(cur.pattern, so@meta.data[[old.field]]))
+    }
+    so@meta.data[[new.field]][grepl(cur.pattern, so@meta.data[[old.field]])] <- cur.group
+    
+  }
+  
+  # ensure groups are ordered and that order is maintained throughout analysis.
+  u.groups <- as.character(unique(so@meta.data[[new.field]]))
+  u.groups <- u.groups[order(u.groups)]
+  so@meta.data[[new.field]] <- factor(so@meta.data[[new.field]], levels = u.groups)
+  so <-so[, keep.this]
+  
+  return(so)
+}
+
+```
+
+```{r percentile ranking function}
+
+prank<-function(x){
+  set.seed(1)
+  r<-rank(x, ties.method="random")/sum(!is.na(x))
+  r[is.na(x)]<-NA
+  r
+}
+
+```
+
+
+```{r assign within-mouse gene rankings, fig.width=10, fig.height=12}
+
+###################################
+# genes are ranked according to within-mouse percentiles
+###################################
+
+# Assign mouse and timepoint labels 
+mapping.list.1 <- list(NSG = "NSG", BALBc = "BALB")
+mapping.list.2 <- list(Early = "Early", Mid = "Mid", Late = "Late")
+so.query.2 <- mapSubsetSeurat(so.query, old.field = "Condition", new.field = "Mouse", mapping.list = mapping.list.1)
+so.query.2 <- mapSubsetSeurat(so.query.2, old.field = "Group", new.field = "Time", mapping.list = mapping.list.2)
+
+# Get gRNA count matrix
+e.mat <- as.matrix(so.query.2@assays[["RNA"]]@data)
+
+if (!pool.duplicates){
+  e.mat[e.mat == -1] <- NA
+}
+
+# Compute wihtin-mouse rankings
+r.mat <- apply(e.mat, 2, prank)
+df.r <- as.data.frame(t(r.mat))
+mouse.id <- rownames(df.r)
+genes <- colnames(df.r)
+df.r <- bind_cols(data.frame(sample.id = mouse.id), df.r)
+s.meta <- so.query.2@meta.data[, c("sample.id", "Mouse", "Time")]
+df.r.meta <- merge(s.meta, df.r, by = "sample.id")
+
+# get coreCTL genes
+coreCTL<-read.delim2(paste(directory, "core_categories.txt",sep = ""),header=TRUE)
+genes.suppressors <- as.character(coreCTL$Supp)
+genes.suppressors <- genes.suppressors[genes.suppressors != ""]
+genes.sensitizer <- as.character(coreCTL$Synth)
+genes.sensitizer <- genes.sensitizer[genes.sensitizer != ""]
+genes.other <- as.character(coreCTL$Supp.Synth)
+genes.other <- genes.other[genes.other != ""]
+
+# convert dataframe from wide to long format
+df.r.long.all <- df.r.meta %>% pivot_longer(cols = genes)
+
+df.r.long.all$guide <- df.r.long.all$name
+
+if (exists("original.features")){
+  u.features <- unique(original.features)
+  
+  for (i in 1:length(u.features)){
+    df.r.long.all$name[grepl(paste(u.features[i], "-", sep= ""), df.r.long.all$name)] <- u.features[i]
+  }
+} else {
+  u.features <- unique(as.vector(expression_matrix$GENE))
+}
+
+# assign coreCTL type
+df.r.long.all$coreCTL <- "other"
+df.r.long.all$coreCTL[df.r.long.all$name  %in% genes.suppressors] <- "suppressor"
+df.r.long.all$coreCTL[df.r.long.all$name  %in% genes.sensitizer] <- "sensitizer"
+
+# assign mVal info
+df.r.long.all$mVal <- NA
+df.r.long.all$mVal[df.r.long.all$name  %in% df.mVal$Core] <- "core"
+df.r.long.all$mVal[df.r.long.all$name  %in% df.mVal$Targeting_Controls] <- "ctrl.targeting"
+df.r.long.all$mVal[df.r.long.all$name  %in% df.mVal$Non.targeting.controls] <- "ctrl.nontargeting"
+df.r.long.all$mVal[df.r.long.all$name  %in% df.mVal$Intergenic] <- "intergenic"
+df.r.long.all$mVal[df.r.long.all$name  %in% df.mVal$Others] <- "others"
+
+# ensure the time points are correctly ordered
+df.r.long.all$Time <- factor(df.r.long.all$Time, levels = c("Early", "Mid", "Late"))
+df.r.long.all.cur <- df.r.long.all
+
+
+```
+
+
+
+```{r compute and cluster probability vectors}
+
+###################################
+# gene rank distributions are clustered to identify and filter out in vivo essentials
+###################################
+
+# flag specifying whether to cluster rank distributions
+cluster.rankDistributions <- T
+
+# specify existing cluster data to load in
+pre.existingClusters <- "invivoClusterData.RData"
+
+if (cluster.rankDistributions){
+  
+  # subset data
+  df.r.long.data <- df.r.long.all[ ,c("Mouse", "Time", "name", "guide", "value")]
+  
+  # identy distributions based off early timepoint
+  df.r.long.data <- df.r.long.data[df.r.long.data$Time == "Early", ]
+  
+  # generate gRNA frequency distributions
+  df.r.long.data.bin <- OneR::bin(df.r.long.data, nbins = 10, labels = NULL, method = c("length", "content", "clusters"), na.omit = TRUE)
+  
+  # calculate probably distributions
+  df.r.bin.sum <- df.r.long.data.bin %>%
+    dplyr::group_by(name,value) %>%
+    tally()
+  df.r.bin.sum <- df.r.bin.sum %>%
+    dplyr::group_by( name) %>%
+    mutate(freq = n/sum(n))
+  
+  # get unique genes
+  u.genes <- as.character(unique(df.r.bin.sum$name))
+  
+  # initiate empty distribution dataframe (with correctly ordered bins)
+  df.dist <- data.frame(levels(df.r.bin.sum$value))
+  colnames(df.dist) <- "bins"
+  
+  # rearrange distributions into correct format (fill in empty entries with 0)
+  for (i in 1:length(u.genes)){
+    df.r.bin.cur <- df.r.bin.sum[df.r.bin.sum$name == u.genes[i], c("value", "freq")]
+    colnames(df.r.bin.cur) <- c("bins", u.genes[i])
+    which.missing <- df.dist$bins[!(df.dist$bins %in%  df.r.bin.cur$bins)]
+    if (length(which.missing) > 0){
+      df.missing <- data.frame(bins = which.missing, val = 0)
+      colnames(df.missing) <- c("bins", u.genes[i])
+      df.r.bin.cur <- bind_rows(df.r.bin.cur, df.missing) 
+    }
+    df.dist <- merge(df.dist, df.r.bin.cur, by.x = "bins")
+  }
+  
+  df.dist.freq <- df.dist %>% dplyr::select(-c("bins"))
+  dist.mat <- t(as.matrix(df.dist.freq))
+  
+  # compute the JSD matrix of a given probability matrix
+  JSDMatrix <- philentropy::JSD(dist.mat)
+  
+  # reformat dist matrix
+  df.dist.long <- pivot_longer(df.dist, cols = u.genes)
+  
+  # hierarchial clusters
+  jsd.dist <- as.dist(JSDMatrix)
+  
+  if (!exists("pre.existingClusters")){
+    hc <- hclust(jsd.dist)
+    
+    # get modules
+    modules <- dynamicTreeCut::cutreeDynamic(dendro = hc, distM = distMatrix, deepSplit = 4, pamRespectsDendro = F,
+                                             minClusterSize = 20, method = "tree")
+    
+    
+  } else {
+    
+    # load pre-existing cluster data
+    load(pre.existingClusters)
+    
+    # override prior df.r.long.all
+    df.r.long.all <- df.r.long.all.cur 
+    
+    # assign colors to modules
+    module.colours = WGCNA::labels2colors(modules)
+    
+    # plot dendrogram
+    WGCNA::plotDendroAndColors(hc, module.colours, 'Signatures', dendroLabels = FALSE, hang = 0.03,
+                               addGuide = TRUE, guideHang = 0.05, main="Rank Distribution Clustering")
+    
+    # get gene to module mapping
+    df.dist.long.annotated <- merge(df.dist.long, df.map, by = "name")
+    
+  }
+  
+  # visualize distribution clusters
+  df.dist.long.annotated %>%
+    ggplot(aes(x = bins, y = value)) + 
+    geom_bar(stat = "identity") + 
+    facet_wrap(~module.color) + 
+    theme_classic() + 
+    ggtitle("Rank Distribution Clusters") + 
+    xlab("Bins (ranks)") + ylab("Count") + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+  # get list of genes to omit (basd on clusters)
+  omit.colors <- c()
+  omit.colors <- c("pink", "turquoise") #"turquoise"
+  
+  omit.which.cluster <- as.character(df.map$name[ df.map$module.color %in% omit.colors])
+  omit.which <- omit.which.cluster
+  
+  omit.which <- omit.which[!(omit.which %in% c("EGFP", "LacZ", "luciferase"))]
+  
+  # filter data according to specified clusters
+  # df.r.long <- df.r.long.all[!(df.r.long.all$name %in% omit.which), ]
+  df.r.long <- df.r.long.all
+} else {
+  df.r.long <- df.r.long.all
+}
+
+```
+
+
+
+
+```{r check which essentials are misclassified}
+
+###################################
+# For genes identified as putative in vivo essentials, compare NSG vs BALB/c distributions. Those that are consistent are classified as in vivo essentials and omitted from subsequent in vivo analysis
+###################################
+
+df.r.ess <- df.r.long.all[df.r.long.all$name %in% omit.which, ]
+df.r.ess <- df.r.ess[df.r.ess$Time == "Early", ]
+
+df.sum.ess <- as.data.frame(df.r.ess) %>%
+  dplyr::group_by(Mouse, Time, name) %>%
+  dplyr::summarize(mean.rank = mean(value),
+                   median.rank = median(value),
+                   max.rank = max(value),
+                   min.rank = min(value),
+                   sd.rank = sd(value),
+                   raw.ranks = list(na.omit(value)))
+
+df.sum.ess$g.rank <- df.sum.ess$median.rank
+
+df.sum.ess.sub <- df.sum.ess[, c("Mouse", "Time", "name","g.rank", "raw.ranks", "median.rank")]
+df.ess.merge <- merge(df.sum.ess.sub[df.sum.ess.sub$Mouse == "NSG", ], df.sum.ess.sub[df.sum.ess.sub$Mouse == "BALBc", ], by = c("Time", "name"))
+
+df.ess.merge <- df.ess.merge %>%
+  group_by(name) %>%
+  mutate(pVal = wilcox.test(unlist(raw.ranks.x), unlist(raw.ranks.y),paired=F)$p.value) 
+
+df.ess.merge$pAdj <-p.adjust(df.ess.merge$pVal, method = "BH", n = length(df.ess.merge$pVal))
+
+```
+
+```{r omit in vivo essentials, fig.height=10, fig.width=5}
+
+essential.fdr <- 0.001
+
+df.ess.merge %>%
+  arrange(-log10(pAdj)) %>%
+  ggplot(aes(x = reorder(name,-log10(pAdj)), y = -log10(pAdj))) + 
+  theme_classic() + 
+  geom_bar(stat = "identity") + coord_flip() + xlab("Putative In vivo Essential Genes") + ylab("-log(p)") + 
+  geom_hline(yintercept = -log10(essential.fdr), color = "red", linetype = "dashed") 
+
+
+import.essential.filter <- T
+
+if (import.essential.filter == T){
+  load("essentialFilter_v2.Rdata")
+} else {
+  which.omit.updated <- df.ess.merge$name[df.ess.merge$pAdj > essential.fdr]
+  
+  # save clustre results
+  save(df.ess.merge, which.omit.updated, file = "essentialFilter_v2.Rdata")
+}
+
+
+omit.which <- which.omit.updated
+
+# remove essentials
+df.r.long <- df.r.long.all[!(df.r.long.all$name %in% omit.which), ]
+
+# keep time points of interest
+time.of.interest <- c("Early", "Mid")
+
+# pool mid and late timepoint
+df.r.long$Time[df.r.long$Time == "Late"] <- "Mid"
+df.r.long <- df.r.long[df.r.long$Time %in% time.of.interest, ]
+
+# rerank filtered genes
+df.r.long <- df.r.long %>%
+  group_by(Time, Mouse, sample.id) %>%
+  mutate(value = prank(value))
+
+
+```
+
+
+```{r venn diagrams (in vitro vs in vivo essentials)}
+
+# generate venn diagram comparing in vivo vs in vitro essential genes
+if (("pink" %in% omit.colors) & ("turquoise" %in% omit.colors)){
+  # get in vitro EMT6 essentials
+  all.ess <-read.delim2(paste(directory, "bftable_all.txt",sep = ""),header=TRUE)
+  include.which <- c("GENE", "EMT6")
+  include.ind <- c()
+  for (i in 1:length(include.which)){
+    include.ind <- c(include.ind, which(grepl(include.which[i], colnames(all.ess)) )) 
+  }
+  EMT6.ess <- all.ess[ , include.ind]
+  
+  # only include genes in mVal library
+  mVal.genes <- as.vector(unlist(df.mVal))
+  EMT6.ess <- EMT6.ess[EMT6.ess$GENE %in% mVal.genes, ]
+  
+  # cast as numerics
+  EMT6.ess$EMT6.HA_T11 <- as.numeric(as.character(EMT6.ess$EMT6.HA_T11))
+  EMT6.ess$EMT6.HA_T19 <- as.numeric(as.character(EMT6.ess$EMT6.HA_T19))
+  
+  # get essentials (BF > 50)
+  EMT6.eGenes.t11 <- unique(as.character(EMT6.ess$GENE[EMT6.ess$EMT6.HA_T11>50]))
+  EMT6.eGenes.t19 <- unique(as.character(EMT6.ess$GENE[EMT6.ess$EMT6.HA_T19>50]))
+  
+  # generate venn diagram
+  set1.invivo <- unique(omit.which)
+  set2.invitro <- unique(EMT6.eGenes.t19)
+  
+  x.genes <- list(in.vivo = set1.invivo, 
+                  in.vitro = set2.invitro)
+  
+  
+  overlap.genes <- intersect(set1.invivo,set2.invitro)
+  invitro.specific <- set2.invitro[!(set2.invitro %in% set1.invivo)]
+  invivo.specific <- set1.invivo[!(set1.invivo %in% set2.invitro)]
+  
+  longest.v <- max(c(length(overlap.genes), length(invitro.specific), length(invivo.specific)))
+  overlap.genes <- c(overlap.genes, rep(NA, longest.v-length(overlap.genes)))
+  invitro.specific <- c(invitro.specific, rep(NA, longest.v-length(invitro.specific)))
+  invivo.specific <- c(invivo.specific, rep(NA, longest.v-length(invivo.specific)))
+  df.geneSets <- data.frame(overlap = overlap.genes, inVitro.specific = invitro.specific, inVivo.specific = invivo.specific)
+  
+  # library(DT)
+  # scMiko::flex.asDT(df.geneSets)
+  
+  ggVennDiagram::ggVennDiagram(x.genes) + ggtitle("Pink + Turquoise Clusters")
+}
+
+
+```
+
+
+
+```{r calculate ranks and statistics, fig.width=10, fig.height=4, warning = F}
+
+if (!pool.duplicates){
+  which.level <- "guide" # one of guide or mouse
+} else {
+  which.level <- "mouse" # one of guide or mouse
+}
+
+if (which.level == "mouse"){
+  # pool at mouse level
+  df.r.sum <- as.data.frame(df.r.long) %>%
+    dplyr::group_by(Mouse, Time, name) %>%
+    dplyr::summarize(mean.rank = mean(value),
+                     median.rank = median(value),
+                     max.rank = max(value),
+                     min.rank = min(value),
+                     sd.rank = sd(value),
+                     raw.ranks = list(na.omit(value)))
+  
+} else if (which.level == "guide"){
+  # pool at guide level
+  df.r.guide <- df.r.long %>%
+    dplyr::group_by(Mouse, Time, guide) %>%
+    dplyr::summarize(name = unique(name),
+                     m.rank = median(value, na.rm = T)) 
+  
+  df.r.sum <- df.r.guide %>% 
+    dplyr::group_by(Mouse, Time, name) %>%
+    dplyr::summarize(mean.rank = mean(m.rank, na.rm = T),
+                     median.rank = median(m.rank, na.rm = T),
+                     max.rank = max(m.rank, na.rm = T),
+                     min.rank = min(m.rank, na.rm = T),
+                     n.rank = length(m.rank),
+                     sd.rank = sd(m.rank, na.rm = T),
+                     raw.ranks = list(m.rank))
+}
+
+df.r.sum$g.rank <- df.r.sum$median.rank
+
+# Reformat data.frame
+df.r.sum.sub <- df.r.sum[, c("Mouse", "Time", "name","g.rank", "raw.ranks", "median.rank")]
+df.r.merge <- merge(df.r.sum.sub[df.r.sum.sub$Mouse == "NSG", ], df.r.sum.sub[df.r.sum.sub$Mouse == "BALBc", ], by = c("Time", "name"))
+
+# label genes by coreCTL type
+df.r.merge$coreCTL <- "Other"
+df.r.merge$coreCTL[df.r.merge$name  %in% genes.suppressors] <- "Suppressor"
+df.r.merge$coreCTL[df.r.merge$name  %in% genes.sensitizer] <- "Sensitizer"
+df.r.merge$coreCTL <- factor(df.r.merge$coreCTL, levels = c("Sensitizer", "Suppressor","Other" ))
+
+# label genes by mVal annotation
+df.r.merge$mVal <- NA
+df.r.merge$mVal[df.r.merge$name  %in% df.mVal$Core] <- "core"
+df.r.merge$mVal[df.r.merge$name  %in% df.mVal$Targeting_Controls] <- "ctrl.targeting"
+df.r.merge$mVal[df.r.merge$name  %in% df.mVal$Non.targeting.controls] <- "ctrl.nontargeting"
+df.r.merge$mVal[df.r.merge$name  %in% df.mVal$Intergenic] <- "intergenic"
+df.r.merge$mVal[df.r.merge$name  %in% df.mVal$Others] <- "others"
+
+# coreCTL-specific colors
+df.r.merge$coreCTL.color <- "#A9A9A9"
+df.r.merge$coreCTL.color[df.r.merge$coreCTL == "Suppressor"] <- "#FFFF00"
+df.r.merge$coreCTL.color[df.r.merge$coreCTL == "Sensitizer"] <- "#0000FF"
+
+# calculate rank differences and averages
+df.r.merge$dif <- df.r.merge$g.rank.y - df.r.merge$g.rank.x
+df.r.merge$avg <- (df.r.merge$g.rank.y + df.r.merge$g.rank.x)/2
+
+df.r.merge %>%
+  ggplot(aes(x = dif)) + 
+  geom_histogram(position = "identity") + 
+  facet_wrap(~ Time)
+```
+
+
+```{r check distributions}
+
+# ranks should be uniformly distributed
+df.r.long %>%
+  ggplot(aes(x = value)) + 
+  geom_histogram(position = "identity") + 
+  facet_wrap(~ Mouse + Time)
+
+if (exists("df.r.guide")){
+  df.r.guide %>%
+    ggplot(aes(x = m.rank)) + 
+    geom_histogram(position = "identity") + 
+    facet_wrap(~ Mouse + Time)
+}
+
+# gene-level ranks
+df.r.sum  %>%
+  ggplot(aes(x = g.rank)) + 
+  geom_histogram(position = "identity") + 
+  facet_wrap(~  Mouse + Time)
+
+```
+
+```{r calculate p-values, warning = F, message=F}
+
+
+# compute p values between NSG and BALB/c mice (wilcoxon ranksum test)
+df.r.merge$p.val.dif <- NA
+
+if (which.level == "guide"){
+  for (i in 1:nrow(df.r.merge)){
+    df.r.merge$p.val.dif[i] <- wilcox.test(unlist(df.r.merge$raw.ranks.x[i]),unlist(df.r.merge$raw.ranks.y[i]),paired=T, exact = T)$p.value
+  }
+} else if (which.level == "mouse"){
+  for (i in 1:nrow(df.r.merge)){
+    df.r.merge$p.val.dif[i] <- wilcox.test(unlist(df.r.merge$raw.ranks.x[i]),unlist(df.r.merge$raw.ranks.y[i]),paired=F)$p.value
+  }
+}
+
+# compute p values between query gene and targetting controls
+df.r.merge$p.val.av <- NA
+df.r.ctrl.targeting <- df.r.merge[df.r.merge$mVal == "ctrl.targeting", ]
+
+for (i in 1:nrow(df.r.merge)){
+
+  rank2test <- c(unlist(df.r.merge$raw.ranks.x[i]),unlist(df.r.merge$raw.ranks.y[i]))
+  df.ctrl.cur <- df.r.ctrl.targeting[as.character(df.r.ctrl.targeting$Time) == as.character(df.r.merge$Time[i]), ]
+  nullRank <- c( unlist(df.ctrl.cur$raw.ranks.x),unlist(df.ctrl.cur$raw.ranks.y))
+  df.r.merge$p.val.av[i] <- wilcox.test(rank2test,nullRank,paired=F)$p.value
+  df.r.merge$avg.dif[i] <- median(rank2test) - median(nullRank)
+}
+
+# flag invivo essentials
+df.r.merge$in.vivo.essential <- F
+df.r.merge$in.vivo.essential[df.r.merge$name %in% which.omit.updated] <- T
+
+# correct for multiple comparisons
+df.r.merge <- df.r.merge %>%
+  dplyr::group_by(Time, in.vivo.essential) %>%
+  mutate(p.adj.dif = p.adjust(p.val.dif, method = "BH", n = length(p.val.dif)),
+         p.adj.avg = p.adjust(p.val.av, method = "BH", n = length(p.val.av)))
+
+# Rank genes based off signed p-values
+df.r.merge$signed.p.dif <- sign(df.r.merge$dif)* abs(-log10(df.r.merge$p.adj.dif))
+df.r.merge$signed.p.avg <- sign(df.r.merge$avg.dif)* abs(-log10(df.r.merge$p.adj.avg))
+
+# assign classificaitons for in vivo screen
+which.p <- 0.05
+p.threshold <- abs(log10(which.p))
+df.r.merge$strain.dependent <- "No Effect"
+df.r.merge$strain.dependent[df.r.merge$signed.p.dif <= -p.threshold] <- "Sensitizer"
+df.r.merge$strain.dependent[df.r.merge$signed.p.dif >= p.threshold] <- "Suppressor"
+df.r.merge$strain.dependent <- factor(df.r.merge$strain.dependent, levels = c("Sensitizer", "Suppressor", "No Effect"))
+
+# assign classificaitons for in vivo screen
+p.threshold <- abs(log10(which.p))
+df.r.merge$strain.independent <- "No Effect"
+df.r.merge$strain.independent[df.r.merge$signed.p.avg <= -p.threshold] <- "Sensitizer"
+df.r.merge$strain.independent[df.r.merge$signed.p.avg >= p.threshold] <- "Suppressor"
+df.r.merge$strain.independent <- factor(df.r.merge$strain.independent, levels = c("Sensitizer", "Suppressor", "No Effect"))
+
+# flag top and bottom 15 hits to label in plots
+flag.top.bottom <- function(df, top.n.hits){
+  df$dif.label <- F
+  df$dif.label[((rank(df$signed.p.dif)) > nrow(df)- top.n.hits) & (abs(df$signed.p.dif) >= abs(log10(which.p)))] <- T
+  df$dif.label[((rank(df$signed.p.dif)) <= top.n.hits) & (abs(df$signed.p.dif) >= abs(log10(which.p)))] <- T
+  
+  df$avg.label <- F
+  df$avg.label[((rank(df$signed.p.avg)) > nrow(df)- top.n.hits) & (abs(df$signed.p.avg) >= abs(log10(which.p)))] <- T
+  df$avg.label[((rank(df$signed.p.avg)) <= top.n.hits) & (abs(df$signed.p.avg) >= abs(log10(which.p)))] <- T
+  return(df)
+}
+
+top.n.hits <- 50
+df.r.early <- flag.top.bottom(df.r.merge[(df.r.merge$Time == "Early"), ], top.n.hits)
+df.r.mid <- flag.top.bottom(df.r.merge[(df.r.merge$Time == "Mid"), ], top.n.hits)
+# df.r.late <- flag.top.bottom(df.r.merge[(df.r.merge$Time == "Late"), ], top.n.hits)
+df.r.merge <- bind_rows(df.r.early, df.r.mid)
+
+# assign rankings based on p.dif and p.avg
+df.r.merge <- df.r.merge %>%
+  group_by(Time) %>%
+  mutate(difRank = rank(signed.p.dif),
+         AvgRank = rank(signed.p.avg))
+
+# bland altman
+df.r.merge %>%
+  ggplot(aes(x = avg.dif, y = dif)) + 
+  geom_point()+
+  facet_wrap(~Time)
+
+```
+
+
+```{r Generate Density & Rug Plots}
+
+library(tidyverse)
+
+# specify plot arguments
+fontsize = 5
+xlims = c(-1, 1)
+cols <- RColorBrewer::brewer.pal(8, "Set1")
+cols <- cols[c(3,1,2)]
+
+# gene of interest
+# gene_levels <- c("Atg3", "Atg7", "Atg5", "Atg10", "Atg9a", "Atg101", "Atg12", "Atg14",
+#                  "EGFP", "LacZ", "luciferase")
+
+gene_levels <- c("Atg3", "Atg7", "Atg5", "Atg10", "Atg9a", "Atg101", "Atg12", "Atg14")
+omit.which <- omit.which[!(omit.which %in% gene_levels)]
+
+if (which.level == "mouse"){
+  
+  # NSG mouse rank medians
+  df.nsg.mean <- df.r.merge[ ,c("Time", "name", "g.rank.x", "median.rank.x")]
+  
+  # BALB/c rank differences
+  df.balb.dif <- merge(filter(df.r.long, Mouse == "BALBc"), df.nsg.mean, by = c("Time", "name"))
+  df.balb.dif <- df.balb.dif[ ,c("Time", "name", "value", "mVal", "g.rank.x", "median.rank.x")]
+  df.balb.dif <- df.balb.dif[!(df.balb.dif$name %in% omit.which), ]
+  df.balb.dif$dif <- df.balb.dif$value - df.balb.dif$median.rank.x
+  
+  # assign non-tartgetting controls to core group
+  
+} else if (which.level == "guide"){
+  
+  df.guide.balbc <- df.r.guide[df.r.guide$Mouse == "BALBc", ]
+  df.guide.nsg <- df.r.guide[df.r.guide$Mouse == "NSG", ]
+  df.guide.merge <- merge(df.guide.balbc, df.guide.nsg, by = c("guide", "Time"))
+  df.guide.merge$dif <- df.guide.merge$m.rank.x - df.guide.merge$m.rank.y
+  df.balb.dif <- df.guide.merge[ ,c("Time", "name.x", "dif")]
+  colnames(df.balb.dif) <- c("Time", "name", "dif")
+  
+  # label genes by coreCTL type
+  df.balb.dif$coreCTL <- "Other"
+  df.balb.dif$coreCTL[df.balb.dif$name  %in% genes.suppressors] <- "Suppressor"
+  df.balb.dif$coreCTL[df.balb.dif$name  %in% genes.sensitizer] <- "Sensitizer"
+  df.balb.dif$coreCTL <- factor(df.balb.dif$coreCTL, levels = c("Sensitizer", "Suppressor","Other" ))
+  
+  # label genes by mVal annotation
+  df.balb.dif$mVal <- NA
+  df.balb.dif$mVal[df.balb.dif$name  %in% df.mVal$Core] <- "core"
+  df.balb.dif$mVal[df.balb.dif$name  %in% df.mVal$Targeting_Controls] <- "ctrl.targeting"
+  df.balb.dif$mVal[df.balb.dif$name  %in% df.mVal$Non.targeting.controls] <- "ctrl.nontargeting"
+  df.balb.dif$mVal[df.balb.dif$name  %in% df.mVal$Intergenic] <- "intergenic"
+  df.balb.dif$mVal[df.balb.dif$name  %in% df.mVal$Others] <- "others"
+  
+}
+
+df.balb.dif$mVal[df.balb.dif$name %in% c("EGFP", "LacZ", "luciferase")] <- "core"
+
+# stratify data by control and genes of interest
+df.ctrl <- df.balb.dif %>%  filter(mVal == "ctrl.targeting")
+df.query <- df.balb.dif %>% filter((name %in% gene_levels) )
+df.query <- df.query[ ,colnames(df.ctrl)]
+
+# aggregate controls
+for (i in gene_levels) {
+  df.ctrl_i <- df.ctrl
+  df.ctrl_i$name <- i
+  df.query <- bind_rows(df.query, df.ctrl_i)
+}
+
+# ensure genes of interest are ordered correctly
+df.query$name <- factor(df.query$name, levels = gene_levels)
+
+# specify timepoint for ploting
+which.time <- "Early"
+
+# get p-values
+pvals <- df.r.merge[(df.r.merge$name %in% gene_levels) & ((df.r.merge$Time == which.time)), c("name", "p.adj.dif")]
+# pvals <- df.r.merge[(df.r.merge$name %in% gene_levels) & ((df.r.merge$Time == which.time)), c("name", "p.adj.avg")]
+colnames(pvals) <- c("name", "pVal")
+pvals <- pvals[order(match(pvals$name, gene_levels)),]
+pvals$name <- factor(pvals$name, levels = gene_levels)
+
+# get color for specified timepoint
+if (which.time == "Early") { col_set <- cols[1] }
+if (which.time == "Mid") { col_set <- cols[2] }
+if (which.time == "Late") { col_set <- cols[3] }
+
+# Median per group
+plot_means <- df.ctrl %>%
+  group_by(Time) %>%
+  summarise(group_mean = median(dif))
+
+# p1: density plot
+fontsize = 7
+p1 <- df.query %>%
+  filter(mVal == "ctrl.targeting") %>%
+  ggplot(aes(x = dif, color = Time, fill = Time)) + 
+  geom_density(bw = 0.1, alpha = 0.3) +
+  theme_classic(base_size = fontsize) +
+  scale_colour_manual(values = cols) +
+  scale_fill_manual(values = cols) +
+  scale_x_continuous(limits = xlims, breaks = seq(xlims[1], xlims[2], by = 0.2)) +
+  labs(y = "Density", x = expression(paste(Delta, " gRNA Rank (BALB/c - NSG)"))) +
+  geom_vline(data = plot_means[which(plot_means$Time==which.time),], aes(xintercept = group_mean), size = 0.3, colour = "black", linetype = "dashed") +
+  theme(legend.position = c(1.05, 0.7),
+        legend.title = element_blank(),
+        legend.text = element_text(size = fontsize/1.2),
+        legend.key.size = unit(0.25, "line"),
+        panel.grid = element_blank())
+
+# p2: rug plot
+alpha.val <- 0.05
+p2 <- df.query %>%
+  filter(Time == which.time) %>%
+  ggplot(aes(x = dif)) +
+  facet_grid(name~., switch = "y") +
+  theme_bw(base_size = fontsize)  + 
+  scale_x_continuous(limits = xlims, breaks = seq(xlims[1], xlims[2], by = 0.2)) +
+  labs(x = expression(paste(Delta, " gRNA Rank (BALB/c - NSG)"))) +
+  geom_rug(data = subset(df.query[df.query$Time == which.time, ], mVal == "ctrl.targeting"), 
+           alpha = alpha.val, col = "grey70", size = 0.7, length = unit(1, "npc")) + 
+  geom_rug(data = subset(df.query[df.query$Time == which.time, ], mVal == "core"), alpha = 1, col = col_set, size = 0.4, length = unit(1, "npc")) +
+  geom_rug(data = subset(df.query[df.query$Time == which.time, ], mVal != "ctrl.targeting" & mVal != "ctrl.nontargeting"),
+           alpha = 1, col = col_set, size = 0.4, length = unit(1, "npc")) + 
+  geom_vline(data = plot_means[which(plot_means$Time==which.time),], aes(xintercept = group_mean), size = 0.3, colour = "black", linetype = "dashed") +
+  theme(strip.text.y = element_text(angle = 180, face = "italic"),
+        strip.background = element_rect(fill = "grey20", color = "grey20", size = 1),
+        strip.text = element_text(colour = "white"),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.line.x = element_blank(),
+        axis.line.y = element_blank(),
+        panel.grid = element_blank(),
+        legend.title = element_blank(),
+        legend.position = "none")
+
+# p3: p-values
+gene_labs <- as.character(signif(pvals$pVal,2))
+names(gene_labs) <- pvals$name
+p3 <- ggplot(pvals) +
+  theme_minimal(base_size = fontsize) +
+  facet_grid(name~., labeller = labeller(name = gene_labs)) + 
+  theme(strip.text.y = element_text(angle = 0, hjust = 0))
+
+
+# Alight density to rug plot
+left <- cowplot::plot_grid(p1, p2, labels = NULL, ncol = 1, align = "v", axis = "bl", rel_heights = c(2,3))
+# Align rug to FDR plot
+right <- cowplot::plot_grid(NULL, p3, ncol = 1, rel_heights = c(2,3))
+# Put together
+print(cowplot::plot_grid(left, right, ncol = 2, rel_widths = c(7,0.8)))
+
+
+```
+
+
+```{r, scatter plots, fig.width = 8, fig.height = 4}
+
+
+df.r.merge.forPlot <- df.r.merge
+df.r.merge.forPlot$p.adj.dif[df.r.merge.forPlot$p.adj.dif>0.05] <- 0.05
+plt.scatter <- df.r.merge.forPlot %>%
+  ggplot(aes(x = g.rank.x, y = g.rank.y)) +
+  geom_point(aes(fill = strain.dependent , size = -log10(p.adj.dif)), color = "#A9A9A9",size = 0.75, pch=21) +
+  geom_point(data = subset(df.r.merge, strain.dependent == 'Sensitizer'),
+             aes(x = g.rank.x, y = g.rank.y, fill =strain.dependent, size = -log10(p.adj.dif)), color = "black",pch=21) +
+  geom_point(data = subset(df.r.merge, strain.dependent == 'Suppressor'),
+             aes(x = g.rank.x, y = g.rank.y, fill =strain.dependent, size = -log10(p.adj.dif)), color = "black",pch=21) +
+  xlab("NSG Gene Rank (percentile)") +
+  ylab("BALB/c Gene Rank (percentile)") +
+  geom_abline(slope = 1, color = "red", size = 0.7) + 
+  theme_bw() + facet_wrap(~ Time) +
+  ggtitle("In Vivo EMT6 Screen") +
+  geom_text_repel(aes(x =g.rank.x, y = g.rank.y, label =ifelse(dif.label ,as.character(name),'')),  size = 4, show.legend = F) + 
+  scale_fill_manual(name = "Classification", values = c("#0000FF", "#FFFF00", "#A9A9A9")) + 
+  theme(panel.grid = element_blank(),
+        axis.line = element_line(colour = "Black"),
+        axis.text.y = element_text(size = 10),
+        axis.text.x = element_text(size = 10),
+        panel.grid.major = element_line(colour="grey",size = rel(0.5)), 
+        legend.position = "none",
+        panel.background = element_rect(fill = "transparent", colour = NA),
+        plot.background = element_rect(fill = "transparent", colour = NA))
+
+plt.scatter 
+```
+
+
+
+```{r rank plots, fig.width=10, fig.height=4}
+
+
+### gene rank plots, stratified time and coreCTL type
+
+# specify point size
+point.size <- 2
+
+# Strain dependent effect ranks
+
+### GRADIENT SCALE
+plt.dif <- df.r.merge %>%
+  ggplot(aes(x = difRank, y = signed.p.dif)) +
+  geom_point(aes(fill = signed.p.dif , size = -log10(p.adj.dif)), color = "black",pch=21) +
+  geom_point(data = subset(df.r.merge, strain.dependent == 'Sensitizer'),
+             aes(x = difRank, y = signed.p.dif, fill =signed.p.dif, size = -log10(p.adj.dif)), color = "black",pch=21) +
+  geom_point(data = subset(df.r.merge, strain.dependent == 'Suppressor'),
+             aes(x = difRank, y = signed.p.dif, fill =signed.p.dif, size = -log10(p.adj.dif)), color = "black",pch=21) +
+  xlab("Gene Rank") +
+  ylab("BALB/c - NSG (Signed -log(FDR))\nStrain-Dependent Effects") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_classic() + facet_wrap(~ Time) +
+  ggtitle("Strain-Dependent Effects: Gene Rank Differences\nFDR<5%") +
+  geom_text_repel(aes(x =difRank, y = signed.p.dif, label =ifelse(dif.label ,as.character(name),''))) +
+  scale_fill_gradient2(name = "Signed -log(FDR)", midpoint=0, low="#0000FF", mid="#A9A9A9", high="#FFFF00", space ="Lab" ) + 
+  geom_hline(yintercept = -log10(0.05)) + 
+  geom_hline(yintercept = log10(0.05)) 
+
+
+df.r.merge.forPlot <- df.r.merge
+df.r.merge.forPlot$p.adj.dif[df.r.merge.forPlot$p.adj.dif>0.05] <- 0.05
+plt.dif <- df.r.merge.forPlot %>%
+  ggplot(aes(x = difRank, y = signed.p.dif)) +
+  geom_point(aes(fill = strain.dependent , size = -log10(p.adj.dif)), color = "black",pch=21) +
+  geom_point(data = subset(df.r.merge.forPlot, strain.dependent == 'Sensitizer'),
+             aes(x = difRank, y = signed.p.dif, fill =strain.dependent, size = -log10(p.adj.dif)), color = "black",pch=21) +
+  geom_point(data = subset(df.r.merge.forPlot, strain.dependent == 'Suppressor'),
+             aes(x = difRank, y = signed.p.dif, fill =strain.dependent, size = -log10(p.adj.dif)), color = "black",pch=21) +
+  xlab("Gene Rank") +
+  ylab("BALB/c - NSG (Signed -log(FDR))\nStrain-Dependent Effects") +
+  geom_hline(yintercept = 0) +
+  theme_classic() + facet_wrap(~ Time) +
+  ggtitle("Strain-Dependent Effects: Gene Rank Differences") +
+  scale_fill_manual(name = "Classification", values = c("#0000FF", "#FFFF00", "#A9A9A9")) + 
+  geom_text_repel(aes(x =difRank, y = signed.p.dif, label =ifelse(dif.label ,as.character(name),'')))
+
+plt.dif
+
+```
+
+
+```{r rank plots for in vivo essentials, fig.width=5, fig.height=5}
+
+### gene rank plots
+# specify point size
+point.size <- 2
+
+# c("turquoise", "pink")
+in.vivo.ess <- as.character(df.map$name[ df.map$module.color %in% c( "pink")])
+in.vivo.ess <- in.vivo.ess[in.vivo.ess %in% omit.which]
+
+df.ess.cur <- df.r.merge[ df.r.merge$name %in% in.vivo.ess, ]
+df.ess.cur <- df.ess.cur[df.ess.cur$Time == "Early", ]
+
+plt.avg <- df.r.merge %>%
+  filter(Time == "Early") %>%
+  ggplot(aes(x = AvgRank, y = signed.p.avg)) +
+  geom_point(aes(fill = signed.p.avg, size = -log10(p.adj.avg)), color = "black",pch=21) +
+  xlab("Gene Rank") +
+  ylab("BALB/c - NSG (Signed -log(FDR))\nStrain-Independent Effects") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_classic() + 
+  ggtitle("Strain-Independent Effects: Gene Rank Averages\nFDR<5%") +
+  scale_fill_gradient2(name = "Signed -log(FDR)", midpoint=0, low="#0000FF", mid="#A9A9A9", high="#FFFF00", space ="Lab" ) + 
+  geom_text_repel(aes(x =AvgRank, y = signed.p.avg, label =ifelse(name %in% in.vivo.ess,as.character(name),'')))
+
+plt.avg
+
+
+```
+
+
+
+```{r print table}
+
+df.output <- df.r.merge
+df.output <- merge(df.output, df.map, by = "name")
+
+df.output[ ,c("g.rank.x", "g.rank.y", "dif", "avg","p.val.dif", "p.val.av",  "p.adj.dif","p.adj.avg")] <- signif(df.output[ ,c("g.rank.x", "g.rank.y", "dif", "avg","p.val.dif", "p.val.av",  "p.adj.dif","p.adj.avg")], 3)
+df.output <- df.output[ , c("Time", "name", "Mouse.x", "g.rank.x", "Mouse.y", "g.rank.y", "coreCTL", "mVal",  "dif", "avg", "p.val.dif",   "p.adj.dif","strain.dependent" ,"module.color", "in.vivo.essential", "p.val.av", "p.adj.avg", "AvgRank")]
+colnames(df.output) <- c("Time", "Gene", "Mouse.x", "rank.x", "Mouse.y", "rank.y", "inVitro.class","library.annotation",  "rank.difference","rank.average", "pVal", "pAdj", "inVivo.class", "cluster.membership", "in.vivo.essential", "p.val.av", "p.adj.avg", "AvgRank")
+DT::datatable(df.output,
+              filter = 'top',
+              extensions = 'Buttons',
+              options = list(pageLength = 50,
+                             dom = 'Bfrtip',
+                             buttons = c('copy', 'csv', 'pdf')))
+
+
+```
+
+
+
+

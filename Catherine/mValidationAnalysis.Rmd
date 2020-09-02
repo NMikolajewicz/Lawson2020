@@ -1,0 +1,357 @@
+---
+title: "mValidation screen analysis"
+author: "Catherine Ross"
+date: "June 24, 2020"
+output:
+  html_document:
+    toc: true
+  pdf_document:
+    toc: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+library(knitr)
+pdf.options(useDingbats = FALSE)
+opts_chunk$set(echo = TRUE, fig.show = "hold", cache = TRUE, dev = c("png", "pdf"))
+```
+
+# Set up workspace
+## Load packages
+
+```{r, loadPackages, message = FALSE, warning = FALSE}
+library(openxlsx)
+library(rio)
+library(reshape2)
+library(fgsea)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+library(ggExtra)
+```
+
+## Define I/O
+
+```{r, defineInput}
+# Foldchange files
+fc_folder <- "input/foldchange"
+fc_files <- list.files(pattern = "foldchange.xlsx", path = fc_folder, full.names = TRUE)
+
+# mVal library files
+library_file <- "input/library_annotations/mVal_full_lib.txt"
+genes_file <- "input/library_annotations/mVal_gene_list.txt"
+
+# mVal normZ score file
+score_file <- "input/library_annotations/Core_MeanNormZ.txt"
+
+# GI data
+gi_file1 <- "input/tables/Table_S17_Fitm2_GI_data.xlsx"
+gi_file2 <- "input/tables/Table_S19_Atg12_GI_data.xlsx"
+
+# Create output folder
+output_folder <- "output/mValidationAnalysis"
+if (!dir.exists(output_folder)) { dir.create(output_folder) }
+```
+
+# Prepare data
+## Foldchange data
+```{r, fcData}
+# Foldchange matrices
+fc <- lapply(fc_files, function(x) read.xlsx(x, sheet = 3))
+
+# Get screen names
+fc_names <- unlist(lapply(strsplit(basename(fc_files), " "), "[", 2))
+cat(paste("Foldchange data for", length(fc_names), "screens:", paste(fc_names, collapse = ", "), "\n"))
+```
+
+## mValidation library data
+
+```{r, mvalData}
+# mVal library gene key and normZ score data
+full_lib <- read.delim(library_file, h = TRUE, stringsAsFactors = FALSE)
+gene_list <- read.delim(genes_file, h = TRUE, stringsAsFactors = FALSE)
+z_score <- read.delim(score_file, h = TRUE, stringsAsFactors = FALSE)
+z_score <- z_score[,-c(1,9)]
+names(z_score)[2:7] <- fc_names[c(1,4,2,3,5,6)]
+
+# Restructure gene key list for easy merging with foldchange matrices
+gene_key <- melt(gene_list, measure.vars=colnames(gene_list))
+colnames(gene_key) <- c("CLASS", "GENE")
+
+# Remove empty rows
+gene_key[which(gene_key$GENE == ""),] <- NA
+gene_key <- na.omit(gene_key)
+
+# Fix mismatching gene names / symbols (matching to foldchange matrices)
+gene_key$GENE[gene_key$GENE == "Luciferase"] <- "luciferase"
+gene_key$GENE[gene_key$GENE == "Intergenic"] <- "intergenic"
+gene_key$GENE[gene_key$GENE == "CD274"] <- "Cd274"
+gene_key$GENE[gene_key$GENE == "CD47"] <- "Cd47"
+
+# Merge with z score data (z>0 = suppressor; z<0 = sensitizer)
+z_melt <- melt(z_score, id.vars="GENE", measure.vars=fc_names)
+z_melt$CLASS <- "Non-hit"
+z_melt[which(z_melt$value > 0),]$CLASS <- "Suppressor"
+z_melt[which(z_melt$value < 0),]$CLASS <- "Sensitizer"
+print(table(z_melt$CLASS))
+```
+
+## Merge data
+
+```{r, mergeData}
+# Merge foldchange data with gene keys (eg core, control, intergenic, etc)
+fc_key <- lapply(fc, function(x) left_join(x, gene_key, by = "GENE"))
+
+# Loop through screens
+for (i in seq_along(fc_key)) {
+  # Add screen name to fc_key df
+  fc_key[[i]]$SCREEN <- NA
+  fc_key[[i]]$SCREEN <- fc_names[i]
+
+  # Classify core genes
+  fc_key[[i]]$CLASS <- as.character(fc_key[[i]]$CLASS)
+  z_melt_fc <- z_melt[z_melt$variable == fc_names[i],]
+
+  for (x in which(fc_key[[i]]$GENE %in% z_melt_fc$GENE)) {
+    gene <- as.character(fc_key[[i]][x,]$GENE)
+    fc_key[[i]][fc_key[[i]]$GENE==gene,]$CLASS <- z_melt_fc[z_melt_fc$GENE==gene,]$CLASS
+  }
+
+  # Calculating differential log2-foldchange
+  ## Defining mid vs late timepoints per screen
+  fc_cols <- data.frame(
+    tp1 = c("T15.*drop.out.", "T15_Control"),
+    tp2 = c("T22.*drop.out", "T24_Control"),
+    tp3 = c("T11.*drop.out", "T11_Control"),
+    tp4 = c("T12.*drop.out", "T12_Control")
+  )
+
+  if (fc_names[i] == "MC38-OVA") {
+    fc_key[[i]]$Tmid_dlogFC <- fc_key[[i]][,grep(fc_cols[1,"tp3"], colnames(fc_key[[i]]))] - fc_key[[i]][,grep(fc_cols[2,"tp3"], colnames(fc_key[[i]]))]
+    fc_key[[i]]$Tlate_dlogFC <- fc_key[[i]][,grep(fc_cols[1,"tp4"], colnames(fc_key[[i]]))] - fc_key[[i]][,grep(fc_cols[2,"tp4"], colnames(fc_key[[i]]))]
+  } else if (fc_names[i] == "B16-OVA") {
+    fc_key[[i]]$Tmid_dlogFC <- fc_key[[i]][,grep(fc_cols[1,"tp4"], colnames(fc_key[[i]]))] - fc_key[[i]][,grep(fc_cols[2,"tp4"], colnames(fc_key[[i]]))]
+    fc_key[[i]]$Tlate_dlogFC <- fc_key[[i]][,grep(fc_cols[1,"tp1"], colnames(fc_key[[i]]))] - fc_key[[i]][,grep(fc_cols[2,"tp1"], colnames(fc_key[[i]]))]
+  } else {
+    fc_key[[i]]$Tmid_dlogFC <- fc_key[[i]][,grep(fc_cols[1,"tp1"], colnames(fc_key[[i]]))] - fc_key[[i]][,grep(fc_cols[2,"tp1"], colnames(fc_key[[i]]))]
+    fc_key[[i]]$Tlate_dlogFC <- fc_key[[i]][,grep(fc_cols[1,"tp2"], colnames(fc_key[[i]]))] - fc_key[[i]][,grep(fc_cols[2,"tp2"], colnames(fc_key[[i]]))]
+  }
+
+  # Remove redundant columns
+  cols_remove <- grep(paste("*Control", "*drop.out*", sep="|"), colnames(fc_key[[i]]))
+  fc_key[[i]] <- fc_key[[i]][,-cols_remove]
+}
+
+# Combine all screen data
+fc_all <- bind_rows(fc_key)
+fc_all <- na.omit(fc_all)
+```
+
+# Plot functions
+## LFC boxplots
+
+```{r, plotBoxplot}
+# Function to plot distribution of mValidation genes
+## timepoint (character) Mid or Late foldchange data to plot
+plotBoxplot <- function(timepoint) {
+
+  # Only keep suppressor, sensitizer, targeting control columns
+  fc_filt <- fc_all[which(fc_all$CLASS %in% c("Suppressor", "Sensitizer", "Targeting_Controls")),]
+  fc_filt[fc_filt$CLASS == "Targeting_Controls",]$CLASS <- "Targeting control"
+  fc_filt$CLASS <- factor(fc_filt$CLASS, levels=c("Suppressor", "Sensitizer", "Targeting control"))
+
+  # Rename Tmid_dlogFC and Tlate_dlogFC columns
+  colnames(fc_filt)[4:5] <- c("Mid", "Late")
+  fc_filt$SCREEN <- factor(fc_filt$SCREEN, levels = fc_names)
+
+  # Melt data and filter for specified timepoint data
+  fc_plot <- melt(fc_filt, measure.vars = c("Mid", "Late"))
+  fc_plot_tp <- filter(fc_plot, variable == timepoint)
+
+  # Plot
+  p <- ggplot(fc_plot_tp, aes(x = CLASS, y = value)) +
+          facet_wrap(.~SCREEN, scales = "free", nrow = 1, strip.position = "bottom") +
+          geom_hline(yintercept = 0, linetype = "dashed", size = 0.5) +
+          geom_jitter(aes(fill = CLASS), size = 1.5, shape = 21, width = 0.2) +
+          geom_boxplot(aes(fill = CLASS), alpha = 0.5, outlier.alpha = 0) +
+          labs(y = expression(paste(Delta, " log"[2], "-foldchange"))) +
+          theme_bw(base_size = 8) +
+          scale_fill_manual(values = c("#F6EB13", "#6D90CA", "#C0BFBF")) +
+          theme(panel.grid = element_blank(),
+                panel.border = element_blank(),
+                axis.title.x = element_blank(),
+                axis.text.x = element_blank(),
+                axis.ticks.x = element_blank(),
+                axis.line = element_line(colour = "black"),
+                strip.background = element_blank(),
+                legend.position = "bottom",
+                legend.title = element_blank())
+
+  # Calculate p values
+  my_comparisons <- list(c("Targeting control", "Sensitizer"), c("Targeting control", "Suppressor"))
+  p <- p + stat_compare_means(label = "p.signif", method = "t.test", comparisons = my_comparisons)
+
+  # Define plot name
+  plot_name <- sprintf("%s/plot_boxplot_mVal_LFC_%s.pdf", output_folder, timepoint)
+
+  # Draw out
+  pdf(plot_name, width = 10, height = 5, useDingbats = FALSE)
+  invisible(print(p))
+  invisible(dev.off())
+
+  # Define p value table name
+  table_name <- sprintf("%s/table_pvalues_mVal_LFC_%s.xlsx", output_folder, timepoint)
+
+  # Generate p value table
+  pval <- compare_means(value ~ CLASS, fc_plot_tp, group.by = "SCREEN", ref.group = "Targeting control", method = "t.test")
+
+  # Write out
+  write.table(pval, file = table_name, col = TRUE, row = FALSE, quote = FALSE, sep = "\t")
+}
+
+```{r, run_plotBoxplot, message = FALSE, warning = FALSE}
+# Call function
+invisible(mapply(plotBoxplot, c("Mid", "Late")))
+```
+
+## GI scatterplots
+
+```{r, plotScatter}
+# Function to plot scatterplot of mValidation GI data
+## gi_file (character) input GI file
+## timepoint (character) mi (Mid) or en (End) data to plot
+## treatment (character) screen-specific treatment condition data to plot
+plotScatter <- function(gi_file, timepoint, treatment) {
+
+  # Read GI file
+  gi <- import_list(gi_file)
+
+  # Clean tables
+  gi <- lapply(gi, function(x) {
+    colnames(x)[1] <- "GENE"
+    return(x)
+  })
+
+  # Select data for specified treatment + timepoint
+  sheet_name <- paste(c(treatment, timepoint), collapse = "_")
+  sheet_num <- grep(sheet_name, names(gi))
+  gi_tp <- gi[[sheet_num]]
+  gi_tp <- na.omit(gi_tp)
+
+  # Define normZ columns of interest
+  norm_wt <- colnames(gi_tp[2])
+  norm_cell <- colnames(gi_tp[3])
+
+  # Define plot axis labels
+  x_lab <- paste(norm_wt, "(qNormZ)")
+  y_lab <- paste(norm_cell, "(qNormZ)")
+
+  # Define sector lines for plotting (median normZ of sens/supp in WT and mutant background)
+  hline1 <- filter(gi_tp, get(norm_cell) < 0, fdr < 0.05) %>% summarise(median(get(norm_cell))) %>% as.numeric
+  hline2 <- filter(gi_tp, get(norm_cell) > 0, fdr < 0.05) %>% summarise(median(get(norm_cell))) %>% as.numeric
+  vline1 <- filter(gi_tp, get(norm_wt) < 0, fdr < 0.05) %>% summarise(median(get(norm_wt))) %>% as.numeric
+  vline2 <- filter(gi_tp, get(norm_wt) > 0, fdr < 0.05) %>% summarise(median(get(norm_wt))) %>% as.numeric
+
+  # Define sector genes
+  gi_tp$group <- NA
+  gi_tp[which(gi_tp[[norm_cell]] >= hline1 & gi_tp[[norm_cell]] <= hline2 & gi_tp[[norm_wt]] >= vline1 & gi_tp[[norm_wt]] <= vline2), "group"] <- "middle"
+  gi_tp[which(gi_tp[[norm_cell]] > hline1 & gi_tp[[norm_cell]] < hline2 & gi_tp[[norm_wt]] < vline1), "group"] <- "middle_left"
+  gi_tp[which(gi_tp[[norm_cell]] > hline1 & gi_tp[[norm_cell]] < hline2 & gi_tp[[norm_wt]] > vline2), "group"] <- "middle_right"
+  gi_tp[which(gi_tp[[norm_cell]] < hline1 & gi_tp[[norm_wt]] > vline1 & gi_tp[[norm_wt]] < vline2), "group"] <- "bottom_middle"
+  gi_tp[which(gi_tp[[norm_cell]] < hline1 & gi_tp[[norm_wt]] < vline1), "group"] <- "bottom_left"
+  gi_tp[which(gi_tp[[norm_cell]] < hline1 & gi_tp[[norm_wt]] > vline2), "group"] <- "bottom_right"
+  gi_tp[which(gi_tp[[norm_cell]] > hline2 & gi_tp[[norm_wt]] > vline1 & gi_tp[[norm_wt]] < vline2), "group"] <- "top_middle"
+  gi_tp[which(gi_tp[[norm_cell]] > hline2 & gi_tp[[norm_wt]] > vline2), "group"] <- "top_right"
+  gi_tp[which(gi_tp[[norm_cell]] > hline2 & gi_tp[[norm_wt]] < vline1), "group"] <- "top_left"
+
+  # Define point fill
+  gi_tp$type <- "none"
+  gi_tp[which(gi_tp[[norm_cell]] <= hline1 & gi_tp$fdr < 0.05), "type"] <- "sensitizer"
+  gi_tp[which(gi_tp[[norm_cell]] >= hline2 & gi_tp$fdr < 0.05), "type"] <- "suppressor"
+  gi_tp$type <- factor(gi_tp$type)
+
+  # Define sector labels by analysis
+  gi_tp$label <- ""
+  if (grepl("Fitm2", gi_file) & grepl("IFN", sheet_name)) {
+    gene_label <- c(
+      "Atg7", "Atg12", "Atg5", "Atg16l1", "Atg10", "Atg3", "Fitm2", "Irf1",
+      "Irgm1", "Irgm2", "Pex1", "Pex16", "Pex6", "Cflar", "Vps13a", "Stub1",
+      "Rnf114", "Elovl1", "Parp10", "Trim32", "Pex2", "Pex3", "Pex19"
+    )
+  } else if (grepl("Fitm2", gi_file) & grepl("CTL", sheet_name)) {
+    gene_label <- c(
+      "Jak2", "Paics", "Ldha", "Inip", "Vps29", "Irf1", "Vps18", "Rnf31", "Vps16",
+      "Fitm2", "Glrx3", "Hexim1", "Tap2", "B2m", "Ube2g2", "Slc39a6", "Sephs1",
+      "Ept1", "Tmem41b", "Far1", "Alg8", "Atp71", "Alg5", "Trim32", "Parp10"
+    )
+  } else if (grepl("Atg12", gi_file) & grepl("TNF", sheet_name)) {
+    gene_label <- c(
+      "Tnfrsf1a", "Sqstm1", "Tradd", "Atg16l1", "Nfkbia", "Atg5", "Casp8", "Atg12",
+      "Atg7", "Atg3", "Atg10", "Ripk1", "Rnf31", "Tbk1", "Ei24", "Ikbkg", "Atg101",
+      "Chuk", "Men1", "Dot1", "Rab1b", "Gnas", "Kmt2a", "Gdi2", "F8a"
+    )
+  } else if (grepl("Atg12", gi_file) & grepl("CTL", sheet_name)) {
+    gene_label <- c(
+      "Rela", "B2m", "Rab1b", "Peli1", "Gnas", "Klhl9", "Tap2", "Raver1", "Men1",
+      "Echs1", "Chuk", "Pcnt", "Smad4", "Rabif", "Irf2", "Ankrd49", "Fas", "Tatdn2",
+      "Fbxw11", "Rbm15", "Wdr45", "Syvn1", "Ube2g2", "Pten", "Det1", "Eif2b5",
+      "Jak2", "Dnaaf5", "Rheb", "Sqstm1", "Med23", "Med25", "Mta2", "Med1", "l7Rn6",
+      "Snrpd3", "Tbk1", "Amd1", "Ccnc", "Atg10", "H2−T23", "Zbtb7a", "Atg7", "Med13",
+      "Iigp1", "Irf9", "Atg12", "Hira", "Med12", "Irf1", "Atg5", "Atg16"
+    )
+  }
+
+  # Label specified points and all coloured (significant) points
+  gi_tp[which(gi_tp$GENE %in% gene_label), "label"] <- gi_tp[which(gi_tp$GENE %in% gene_label), "GENE"]
+  gi_tp[which(gi_tp$type == "sensitizer" | gi_tp$type == "suppressor"), "label"] <- gi_tp[which(gi_tp$type == "sensitizer" | gi_tp$type == "suppressor"), "GENE"]
+
+  # Prevent labelling of insignificant genes (FDR >= 0.05)
+  gi_tp[which(gi_tp$fdr >= 0.05), "label"] <- ""
+
+  # Plot
+  p2 <- ggplot(gi_tp, aes(x = get(norm_wt), y = get(norm_cell), fill = type)) +
+          geom_hline(yintercept = hline1, linetype = "dashed", size = 0.1, colour = "grey80") +
+          geom_hline(yintercept = hline2, linetype = "dashed", size = 0.1, colour = "grey80") +
+          geom_vline(xintercept = vline1, linetype = "dashed", size = 0.1, colour = "grey80") +
+          geom_vline(xintercept = vline2, linetype = "dashed", size = 0.1, colour = "grey80") +
+          geom_point(data = subset(gi_tp, fdr >= 0.05), size = 0.1, shape = 21, colour = "grey80", fill = "grey80", stroke = 0.1) +
+          geom_point(data = subset(gi_tp, fdr < 0.05), aes(size = abs(log2(fdr))), shape = 21, stroke = 0.1) +
+          scale_fill_manual(values = c("grey80", "#00AEEF", "#FCCC00")) +
+          scale_colour_manual(values = c("grey80", "#00AEEF", "#FCCC00")) +
+          scale_size_continuous(range = c(0.5, 2)) +
+          geom_text_repel(aes(label = label, colour = type), size = 1.78, fontface = "italic", segment.size = 0.1) +
+          labs(x = x_lab, y = y_lab) +
+          theme_bw(base_size = 5) +
+          theme(legend.position = "none",
+                axis.line = element_line(colour = "black"),
+                panel.grid.major = element_blank(),
+                panel.grid.minor = element_blank(),
+                panel.border = element_blank(),
+                panel.background = element_blank())
+
+  # Define plot name
+  file_name <- gsub(".xlsx", "", basename(gi_file))
+  plot_name2 <- sprintf("%s/plot_scatter_%s_%s_%s.pdf", output_folder,  file_name, timepoint, treatment)
+
+  # Draw out
+  pdf(plot_name2, width = 3, height = 3, useDingbats = FALSE)
+  invisible(print(p2))
+  invisible(dev.off())
+}
+```
+
+```{r, run_plotScatter, message = FALSE, warning = FALSE}
+# Call function on GI files
+invisible(mapply(plotScatter, gi_file1, c("en", "mi"), "IFN"))
+invisible(mapply(plotScatter, gi_file1, c("en", "mi"), "CTL"))
+invisible(mapply(plotScatter, gi_file2, c("en", "mi"), "TNF"))
+invisible(mapply(plotScatter, gi_file2, c("en", "mi"), "CTL"))
+```
+
+# End of code
+
+```{r, endVignette}
+sessionInfo()
+```

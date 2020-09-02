@@ -1,0 +1,635 @@
+---
+title: "TCGA Analysis"
+output: html_document
+---
+
+```{r load libraries, include=FALSE}
+
+# clear global enviroment                          
+rm(list = ls())
+
+# load packages
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ggrepel)
+library(org.Hs.eg.db)
+library(gplots)
+library(RColorBrewer)
+library(cgdsr)
+library(TCGAbiolinks)
+library(GSVAdata)
+library(GSVA) 
+library(parallel)
+library(ppcor)
+
+```
+
+
+```{r parameter specifications}
+
+
+# specify which TCGA datasource to use:
+# option 1: 'biolinks' (TCGA Biolinks)
+# option 2: 'pancancer' (Cancer Genomics Data Server; CGDS)
+which.tcga.data <- "biolinks" #pancancer, biolinks
+
+#flag to remove duplciate entries
+rmv.duplicates <- T
+
+```
+
+
+```{r get coreCTL}
+
+# import coreCTL genes
+coreCTL <- read.table("core_drugZV1.txt", header = T, stringsAsFactors = F)
+coreCTL.Hs <- toupper(coreCTL$GENE)
+
+```
+
+
+
+```{r get panCancer Data, warning = F, message = F}
+
+
+# panCancer dataset is computationally intensive to retrieve from db (>1 h), so recommended to store locally
+# if TRUE, imports local file - if false, downloads data from server
+import.panCancerData <- T
+
+if (which.tcga.data == "pancancer"){
+  
+if (!import.panCancerData){
+  
+  ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+mapping <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"), mart = ensembl)
+mapping <- mapping[complete.cases(mapping), ]
+mapping <- mapping[mapping$hgnc_symbol != "", ]
+mapping <- mapping[grepl("ENSG", mapping$ensembl_gene_id), ]
+
+# Create CGDS object
+mycgds <- CGDS("https://www.cbioportal.org/")
+
+# Get list of panCancer studies at server
+cancerStudies.list <- getCancerStudies(mycgds)
+which.pan <-  sapply(cancerStudies.list$name, function(x) grepl("PanCancer", x))
+panCancerStudies.list <- cancerStudies.list[which.pan, ]
+
+# get RNAseq entry IDs
+df.entry.rna <- NULL
+for (i in 1:nrow(panCancerStudies.list)){
+  cases <- getCaseLists(mycgds, panCancerStudies.list$cancer_study_id[i])
+  which.rna.case <- sapply(cases$case_list_description, function(x) grepl("RNA", x))
+  
+  profiles <- getGeneticProfiles(mycgds,panCancerStudies.list$cancer_study_id[i])
+  which.rna.profile <- sapply(profiles$genetic_profile_name, function(x) grepl("mRNA Expression, RSEM", x))
+  
+  df.entry.rna <- bind_rows(df.entry.rna, bind_cols(panCancerStudies.list[i, ], cases[which.rna.case, ], profiles[which.rna.profile, ]))
+}
+
+# specify cancer type for each study
+df.entry.rna$cancer.type <- sapply(df.entry.rna$name, function(x) strsplit(x, " (", fixed= T)[[1]][1]) 
+df.entry.rna$cancer.type <- gsub(" ", ".", df.entry.rna$cancer.type)
+
+# get RNAseq data
+df.rna.list <- list()
+
+max.chunk <- 500 # data must be retrieved in chunks (CGDS API doesn't allow more than 1000 queries at a time)
+query.genes <- mapping$hgnc_symbol
+# query.genes <- colnames(df.rna.cur)
+for (i in 1:nrow(df.entry.rna)){
+  mycaselist <- df.entry.rna$case_list_id[i]
+  mygeneticprofile <- df.entry.rna$genetic_profile_id[i]
+  
+  df.rna.cur <- NULL
+  for (j in 1:ceiling(length(query.genes)/max.chunk)){
+    start.ind <- 0+((j-1)*max.chunk)
+    end.ind <- start.ind + max.chunk
+    if (end.ind > length(query.genes)) end.ind <- length(query.genes)
+    df.query <- getProfileData(mycgds,query.genes[start.ind:end.ind],mygeneticprofile,mycaselist)
+    df.rna.cur <- bind_cols(df.rna.cur,df.query)
+    
+    if (j == 1) patient.id <- rownames(df.query)
+  }
+
+  df.rna.cur <- bind_cols(data.frame(cancer.id = rep(df.entry.rna$cancer.type[i], nrow(df.rna.cur)), sample.id = patient.id), df.rna.cur)
+  df.rna.list[[i]] <- df.rna.cur
+}
+
+# combine all data.frames 
+df.rna <- data.table::rbindlist(df.rna.list)
+rm("df.rna.list")
+
+# save data
+saveRDS(df.rna, "panCancer_v3_100420.rds")
+
+} else {
+  
+  # load data
+  df.rna <- readRDS("panCancer_v3_100420.rds")
+}
+
+# prep sample info
+df.info <- df.rna %>% dplyr::select(c("cancer.id", "sample.id"))
+df.info$sample_id <- as.character(df.info$sample.id)
+df.info$sample_id <- gsub("[...]", "_", df.info$sample_id)
+df.info$sample_id <- gsub("[.]", "_", df.info$sample_id)
+
+# strip last 3 characters 
+df.info$sample_id.v2 <- gsub('.{3}$', '', df.info$sample_id)
+
+# prep expression matrix
+df.mat <- df.rna %>% dplyr::select(-c("cancer.id", "sample.id"))
+mat.rna <- as.matrix(df.mat)
+
+# ensure no NA present
+omit.gene.na <- apply(mat.rna, 2, function(x) sum(is.na(x))) > 0
+mat.rna <- mat.rna[ , !omit.gene.na]
+omit.gene.nan <- apply(mat.rna, 2, function(x) sum(is.nan(x))) > 0
+mat.rna <- mat.rna[ , !omit.gene.nan]
+
+# get coreCTL specific matrix
+mat.core <- mat.rna[ ,colnames(mat.rna) %in% coreCTL.Hs]
+
+}
+```
+
+
+
+```{r get TCGA biolinks Data, warning = F, message = F}
+
+
+# get data frame TCGA biolinks
+import.TCGAbiolinksData <- T
+
+if (which.tcga.data == "biolinks"){
+
+if (import.TCGAbiolinksData){
+  df.rna <- readRDS("panCancer_v4_170420.rds") 
+} else {
+
+project.list <- TCGAbiolinks:::getGDCprojects()$project_id
+project.list <- project.list[grepl("TCGA-", project.list)]
+
+query <- GDCquery(project = project.list,
+                           data.category = "Transcriptome Profiling",
+                           data.type = "Gene Expression Quantification",
+                  workflow.type = "HTSeq - FPKM")
+
+output.dir <- "D:/Users/Nick/Dropbox/PDF Projects - JM/Data/tcga/"
+GDCdownload(query, method = "api", files.per.chunk = 100, directory= output.dir)
+df.rna <- GDCprepare(query, directory = output.dir)
+
+saveRDS(df.rna, "panCancer_v4_170420.rds")
+
+}
+
+exp.data <- df.rna@assays@data@listData[["HTSeq - FPKM"]]
+colnames(exp.data) <- df.rna@colData@listData[["patient"]]
+rownames(exp.data) <- df.rna@rowRanges@elementMetadata@listData[["external_gene_name"]]
+exp.data <- as.data.frame(t(exp.data))
+
+# prep sample info
+df.info <- data.frame(sample.id = rownames(exp.data))
+df.info$sample_id <- as.character(df.info$sample.id)
+df.info$sample_id <- gsub("[...]", "_", df.info$sample_id)
+df.info$sample_id <- gsub("[.]", "_", df.info$sample_id)
+df.info$sample_id.v2 <- df.info$sample_id
+
+# prep expression matrix
+df.mat <- exp.data
+mat.rna <- as.matrix(df.mat)
+
+# ensure no NA present
+omit.gene.na <- apply(mat.rna, 2, function(x) sum(is.na(x))) > 0
+mat.rna <- mat.rna[ , !omit.gene.na]
+omit.gene.nan <- apply(mat.rna, 2, function(x) sum(is.nan(x))) > 0
+mat.rna <- mat.rna[ , !omit.gene.nan]
+
+# get coreCTL specific matrix
+mat.core <- mat.rna[ ,colnames(mat.rna) %in% coreCTL.Hs]
+
+}
+
+```
+
+
+```{r IPRES genesets}
+
+
+##reading in pre-existing data sets
+data(c2BroadSets) #GSVA-package built in set
+
+
+IPRES.signatures <- c("VECCHI_GASTRIC_CANCER_ADVANCED_VS_EARLY_UP", "MAPKi_INDUCED_EMT", "LU_TUMOR_ANGIOGENESIS_UP", "LU_TUMOR_ENDOTHELIAL_MARKERS_UP",
+                "LU_TUMOR_VASCULATURE_UP", "ROY_WOUND_BLOOD_VESSEL_UP", "POST_OP_WOUNDHEALING", "MAPKi_INDUCED_ANGIOGENESIS",
+                "EP_BLOOD_VESS_DEVEL_DN_IN_R", "MISHRA_CARCINOMA_ASSOCIATED_FIBROBLAST_UP", "LIEN_BREAST_CARCINOMA_METAPLASTIC",
+                "MAHADEVAN_GIST_MORPHOLOGICAL_SWITCH", "WESTON_VEGFA_TARGETS_6HR", "WESTON_VEGFA_TARGETS_12HR",
+                "MS_RESP_TO_WOUNDING_UP_IN_MAPKi_aPDL1_NR", "POOLA_INVASIVE_BREAST_CANCER_UP", "YE_METASTATIC_LIVER_CANCER",
+                "KARAKAS_TGFB1_SIGNALING", "JAEGER_METASTASIS_UP", "MS_RESP_TO_HYPOXIA_UP_IN_MAPKi_aPDL1_NR", 
+                "MAINA_VHL_TARGETS_DN", "HARRIS_HYPOXIA", "JEON_SMAD6_TARGETS_DN", "LEF1_UP.V1_UP", 
+                "CHARAFE_BREAST_CANCER_BASAL_VS_MESENCHYMAL_UP", "ANASTASSIOU_MULTICANCER_INVASIVENESS_SIGNATURE")
+
+##MAPKi geneset compilation
+mapki.genesets <- list(
+  
+  MAPKi_INDUCED_EMT = c("ADAM12","AURKA","BCAT1","BGN","CDH11","CENPF","CKS2","COL10A1","COL11A1","COL3A1","COL5A1","COL5A2","COL6A2","COL6A3","DTL","EPYC","FAP", "FCGR1B","FN1","GREM1","IGHM","INHBA","KIF2C","LOXL2","LRRC15","MMP11","NCAPG","NID2","NUAK1","RRM2","SLC16A3","SULF1","TNFAIP6","VCAN"),
+  
+  MAPKi_INDUCED_ANGIOGENESIS =  c("ANPEP","BGN","BMP4","CDH5","COL3A1","CYR61","DLL4","EDN1","EMCN","ID1","KDR","NRP1","PLAU","PPAP2B","PROK2","PRRX2","RHOB","ROBO4","SOX17", "SOX18","TGFB2","THBS1","THY1","VEGFA","VEGFC"),
+  
+  EP_BLOOD_VESS_DEVEL_DN_IN_R = c("FGF9", "PGF", "S100A7", "PDGFA", "TNFRSF12A", "EDN1","ANPEP", "PRRX2", "SRF","CDH5","TGFB2", "SHB", "HAND2", "HMOX1", "ROBO4", "RHOB","IL1B","SOX18","SOX17","THBS1", "ANGPT2", "PPAP2B", "CYR61", "BMP4","KLF5", "FLT1","JUNB","SLIT2", "KDR","PROK2","VEGFC","BGN", "MEOX2", "EREG", "ID1","JMJD6", "DLL4", "VEGFA"),
+  
+  MS_RESP_TO_WOUNDING_UP_IN_MAPKi_aPDL1_NR = c("ADORA3", "PDGFA","TLR2", "ADORA1","TGFB1","IL10", "CD97","S1PR3","GPX1","NLRC4", "MYD88", "CCL3L1", "SERPINA3", "CHST2", "STXBP1", "CCL4L2","SERPING1", "CD40", "GAL", "PLAUR", "C8G","ADM","CTSB", "VSIG4","PLA2G2D", "TPST1","GGCX","TF","CCL2", "RTN4RL1","ADORA2A","CCL8", "C1R","ITGB3","FPR2","TIMP3","TNFRSF4", "CCL7", "TNFRSF1A","SLC11A1", "TNFRSF1B","GP1BB","IL10RB", "RAC1","SCN9A","ENO3","C2","SCG2","FN1", "SPP1", "NOX4", "PLAT", "IL2RA","TNFSF4", "STAT3","CCNB1","APOL2","CD55","TFRC","C1RL","SYT17"),
+  
+  MS_RESP_TO_HYPOXIA_UP_IN_MAPKi_aPDL1_NR = c("TF","CCL2","FLT1","ACTN4", "SOCS3", "PDGFA", "ALDOC", "EGLN3", "NR4A2","TGFB1", "DDIT4","CD38", "HYOU1", "HSP90B1", "PLOD1", "TFRC", "ADM", "PLOD2", "VEGFA", "PSEN2","MT3","ANGPTL4"),
+  
+  POST_OP_WOUNDHEALING = c( "MMP3", "PPBP", "CXCL5", "PTX3", "PTHLH", "TDO2", "SPINK6", "SPP1", "MMP10", "IL8", "MME", "GREM1", "CTSZ", "CXCL6", "THBS1", "SCG5", "TFPI2", "PTGS2", "CXCL1", "IL1A", "PCSK1", "AREG","IL13RA2", "KIAA1199", "CCL18", "FST", "LILRB1", "CTNNB1", "CLC", "CXCL3", "CEACAM6", "LILRB2", "ITCH", "S100A12", "CCDC102B", "GLIS3","MS4A6E", "RARRES1", "NRG1","PHLDA1", "MS4A4A","HAS2","TFEC", "CCR1","ANXA3", "CR1", "IL1RL1", "ADAM12", "CCNA1", "PLA2G7","ENPEP","SPON1", "INHBA","STEAP1", "STEAP4","TMSB15A", "FGF7", "PI15", "C8orf4", "CYBB", "MED18", "IGSF6", "SAA1", "RGS13", "DEFB4A","SLC16A3","CCL3","AQPEP","CYP1B1","FAM20A","DKK1","IKBIP","SULF1","PXDN","HMOX1","FMO3","SERPINA3", "NAA15", "MSR1", "CCL8", "TMEFF1", "KLK6", "C13orf33", 'TNFAIP6', "MGST1","SRSF6","SRGN","IGF2BP3","PCSK5","LAMC2","OLFML2B","NCEH1","FABP4","IL6","C5AR1", "ALDH1A3", "PDPN", "LYZ", "CD163", "RAB12", "RGS18", "HBB","TIMP1","CNN3","FAM83A","CYR61","TNC","DPYSL3","PRR16","BAG2","DSEL","LIPG","PLAC8","CXCL2","FCER1G","SUSD5","NEXN","KLHL6","LMNB1",'GPRC5A', "TCEAL7","FPR1","APOBEC3A","ITGB6","HS3ST1","GBP6","ITGB5","ADIPOQ","CPXM1","PKP2","NNMT","OLR1","PPP3R1","BUB1","BCL2A1","MAP9", "GCLM","S100P","F3","TMPRSS11E","BEND6","FCGR3A","DDX3Y","PI3","MS4A7","FCN1","TLR4","UCHL1","CYTL1","ST8SIA4","MMP9","ALDH1L2","DEPDC1","RNASE2", "SPINK7"),
+
+  CHARAFE_BREAST_CANCER_BASAL_VS_MESENCHYMAL = c("RAB25","LAD1","KIAA1522","TACSTD2","AKR1B10","ST14","OVOL2","PPL","BLNK","MUC1","CBLC","TMEM191A", "STEAP4", "DMKN","SERPINA3", "PPP1R14C","EPN3","BSPRY", "TLCD1","ESRP1","ESRP2", "EPB41L4A", "EHF", "GRAMD2", "PRSS8", "TSC22D3", "MARVELD2","CD24", "SCNN1A","KLK6","TRIM29","ATP1A1","RNF43","PROM2","GPR110"),
+  ANASTASSIOU_CANCER_MESENCHYMAL_TRANSITION = c("COL11A1", "THBS2", "SNAI2", "ACTA2", "BGN", "CDH11", "COL1A1", "COL3A1", "COL5A2", "COL6A3", "CTSK", "EDNRA", "FBN1", "FN1", "LGALS1", "LOXL2", "LUM", "MMP2", "NID2", "PDGFRB", "PRRX1", "SERPINF1", "SPARC", "SULF1", "TIMP3", "VCAN")
+)
+
+# check gene set availability
+which.available.1 <-  names(c2BroadSets)[names(c2BroadSets) %in% IPRES.signatures]
+which.available.2 <-  c(names(mapki.genesets))[names(mapki.genesets) %in% IPRES.signatures]
+which.missing <- IPRES.signatures[!(IPRES.signatures %in% c(which.available.1, which.available.2))]
+
+# get available IPRESS signatures from Broad database
+broad.genesets <- list()
+for (i in 1:length(which.available.1)){
+  my.entrez <- NULL
+  set.name <- which.available.1[i]
+  cur.broadSet <- c2BroadSets[[set.name]]
+  cur.entrez <- cur.broadSet@geneIds
+  my.entrez <- AnnotationDbi::select( org.Hs.eg.db::org.Hs.eg.db,
+                                      keys = cur.entrez,
+                                      columns = c("SYMBOL", "ENTREZID"),
+                                      keytype = "ENTREZID")
+  broad.genesets[[set.name]] <- my.entrez$SYMBOL
+}
+
+# get remaining missing sets
+msigdbr.db <- msigdbr::msigdbr(species = "Homo sapiens", category = NULL,  subcategory = NULL)
+
+misc.genesets <- list()
+for (i in 1:length(which.missing)){
+  msigdbr.db.cur <- msigdbr.db[msigdbr.db$gs_name %in% which.missing[i], ]
+  set.name <- unique(msigdbr.db.cur$gs_name)
+  stopifnot(length(set.name) == 1)
+  misc.genesets[[set.name]] <- msigdbr.db.cur$human_gene_symbol
+}
+
+# combine all genesets into final list
+all.genesets <- c(broad.genesets, mapki.genesets, misc.genesets)
+
+# assertion
+stopifnot(sum(IPRES.signatures %in% names(all.genesets)) == length(IPRES.signatures))
+
+```
+
+
+
+
+```{r NM - IPRES enrich}
+
+# get gsva scores
+import.gsvaIPRES <- F
+if (import.gsvaIPRES){
+  gsva.IPRES <- readRDS("gsva_IPRES_110420.rds")
+} else {
+
+  # compute GSVA scores (computationally intensive step)
+  which.method <- "zscore" # default: gsva
+  
+  n.chunks <- 10
+  
+  n.per.chunk <- round(nrow(mat.rna)/n.chunks)
+  gsva.IPRES <- NULL
+  ind.first <- 1
+  for (i in 1:n.chunks){
+    ind.last <-ind.first + n.per.chunk
+    
+    if (ind.last > nrow(mat.rna)) ind.last <- nrow(mat.rna)
+    chunk.range <- seq(ind.first, ind.last)
+    
+    gsva.IPRES.cur <- gsva(log10(t(mat.rna[chunk.range, ])+1e-20), 
+                           all.genesets, parallel.sz=0, verbose = T, method = which.method)
+    
+    if (is.null(gsva.IPRES)) {
+      gsva.IPRES <- gsva.IPRES.cur
+    } else {
+      gsva.IPRES <- cbind(gsva.IPRES, gsva.IPRES.cur)
+    }
+    
+    ind.first <- ind.last + 1
+  }
+
+}
+
+# pool z-scores within each sample
+gsva.IPRES.pool <- apply(gsva.IPRES, 2, function(x) mean(x))
+hist(gsva.IPRES.pool)
+
+# consolidate final results
+df.IPRES <- data.frame(sample.id =  df.info$sample_id.v2, IPRES = gsva.IPRES.pool)
+# df.IPRES <- data.frame(sample.id =  df.info$sample.id, IPRES = gsva.IPRES.pool)
+
+
+# remove duplicates
+if (rmv.duplicates){
+ df.IPRES <- df.IPRES[!duplicated(df.IPRES$sample.id ), ] 
+}
+
+```
+
+
+```{r hERV score}
+
+##Import hERV table from Smith et al 2018
+hERV <- read.table("Smith2018_TS12_hERV_scores_100420.txt", 
+                   header = T, stringsAsFactors = F)
+
+df.info.hERV <- hERV %>% dplyr::select(c("Sample_ID"))
+colnames(df.info.hERV) <- "sample.id"
+df.mat.hERV <- hERV %>% dplyr::select(-c("Sample_ID"))
+hERV.mat <- as.matrix(df.mat.hERV)
+
+# pool hERV within each sample
+hERV.mat.pool <- apply(hERV.mat, 1, function(x) mean(x))
+
+# consolidate final results
+df.hERV <- data.frame(sample.id = df.info.hERV$sample.id, hERV = hERV.mat.pool)
+df.hERV$sample.id <- gsub('.{3}$', '', df.hERV$sample.id)
+
+
+# remove duplicates
+if (rmv.duplicates){
+ df.hERV <- df.hERV[!duplicated(df.hERV$sample.id ), ] 
+}
+
+
+```
+
+
+```{r immune characteristics scores}
+
+# import Thorsson et al 2018 immune characteristics
+df.immune.all <- read.csv("Thorsson2018_TS1_immuneCharacteristics_100420.txt", 
+                          sep = "\t", header = T, stringsAsFactors = F)
+
+# get immune chracteristics of interest
+which.char <- c("TCGA.Participant.Barcode", "Leukocyte.Fraction" , "Lymphocyte.Infiltration.Signature.Score",  "IFN.gamma.Response",  "T.Cells.CD8" , "Lymphocytes")
+df.immune.sub <- na.omit(df.immune.all[, which.char]) #selected correlates + TCGA sample barcode
+colnames(df.immune.sub) <- c("sample.id", "Leukocyte.Fraction" , "Lymphocyte.Infiltration.Signature.Score",  "IFN.gamma.Response",  "T.Cells.CD8" , "Lymphocytes")
+df.immune.sub$sample.id <- gsub("-", "_", df.immune.sub$sample.id)
+
+# remove duplicates
+if (rmv.duplicates){
+ df.immune.sub <- df.immune.sub[!duplicated(df.immune.sub$sample.id ), ] 
+}
+
+# additionally, get immune subtypes
+which.char <- c("TCGA.Participant.Barcode", "Immune.Subtype", "OS")
+df.immuneSubtype <- na.omit(df.immune.all[, which.char]) #selected correlates + TCGA sample barcode
+colnames(df.immuneSubtype) <- c("sample.id", "Immune.Subtype", "OS")
+df.immuneSubtype$sample.id <- gsub("-", "_", df.immuneSubtype$sample.id)
+
+# compute cytolytic index (Rooney et al 2015)
+df.cytoRaw <- data.frame( mat.rna[,c("GZMA", "PRF1")])
+df.cytoRaw$cytolytic.index <- apply(df.cytoRaw, 1, function(x) psych::geometric.mean(x, na.rm = T))
+df.cyto <- data.frame(sample.id = df.info$sample_id.v2, cytolytic.index = df.cytoRaw$cytolytic.index)
+
+# remove duplicates
+if (rmv.duplicates){
+ df.cyto <- df.cyto[!duplicated(df.cyto$sample.id ), ] 
+}
+
+# merge Thorsson 2018 and Rooney 2015 scores
+df.immuneCharacteristics <- merge(df.immune.sub, df.cyto, by = "sample.id")
+
+
+# remove duplicates
+if (rmv.duplicates){
+ df.immuneCharacteristics <- df.immuneCharacteristics[!duplicated(df.immuneCharacteristics$sample.id ), ] 
+}
+
+```
+
+
+```{r partial correlation helper function}
+
+getPCor <- function(df, gene.names, score.names){
+  
+  xy <- as.matrix(df[ ,c(score.names, gene.names, "purity")])
+  xy <- xy[complete.cases(xy), ]
+
+mat.cor <- matrix(ncol = length(score.names), nrow = length(gene.names))
+for ( i in 1:length(score.names)){
+
+  for (j in 1:length(gene.names)){
+    
+      p.c <- pcor.test(x = (xy[ ,gene.names[j]]), 
+                       y = xy[ ,score.names[i]], 
+                       z = xy[ ,"purity"], 
+                       method = "spearman")[["estimate"]] 
+
+    mat.cor[j,i] <- p.c
+  }
+}
+ 
+return(mat.cor)
+  
+}
+
+```
+
+
+```{r consolidate scores, calculate correlations}
+
+# combine all scores
+if (exists("df.IPRES")){
+  df.all <- merge(df.IPRES, df.hERV, by = "sample.id")
+df.all <- merge(df.all, df.immuneCharacteristics, by = "sample.id")
+} else {
+  df.all <- merge(df.hERV, df.immuneCharacteristics, by = "sample.id")
+}
+
+
+# get tumor purity estimates
+df.purity <- read.csv("Tumor_purity_cpe.csv", 
+                         header = T, stringsAsFactors = F)
+df.purity <- df.purity[ ,c("Sample.ID","ESTIMATE" )]
+colnames(df.purity) <- c("sample.id", "purity")
+df.purity$sample.id <- gsub('.{4}$', '', df.purity$sample.id)
+df.purity$sample.id <- gsub('-', '_', df.purity$sample.id)
+
+# remove duplicates
+if (rmv.duplicates){
+ df.purity <- df.purity[!duplicated(df.purity$sample.id ), ] 
+}
+
+df.all <- merge(df.all, df.purity, by = "sample.id")
+
+# filter RNA data (include only subjects that remain in scoring matrix)
+which.available <- unique(df.all$sample.id)
+keep.which <-  df.info$sample_id.v2 %in% which.available
+which.samples <- df.info$sample_id.v2[keep.which]
+mat.core.available <- mat.core[keep.which, ]
+df.core <- bind_cols(data.frame(sample.id = which.samples), as.data.frame(mat.core.available))
+
+# get row and column names
+gene.names <- colnames(mat.core.available)
+score.names <- colnames(df.all %>% dplyr::select(-c("sample.id", "purity")))
+
+# get random sample of genes
+which.rand <- sample(seq(1:ncol(mat.rna)), length(gene.names))
+df.rand <- bind_cols(data.frame(sample.id =  df.info$sample_id.v2[match(which.samples, df.info$sample_id.v2)]), 
+                     as.data.frame(mat.rna[ match(which.samples, df.info$sample_id.v2),which.rand]))
+rand.genes.names <- colnames(df.rand)[2:ncol(df.rand)]
+
+# merge scores with RNA expression data
+df.all.core <- merge(df.all, df.core, by = "sample.id")
+df.all.rand <- merge(df.all, df.rand, by = "sample.id")
+
+# compute partial correlation (adjusting for tumor purity)
+mat.cor.core <- getPCor(df.all.core, gene.names, score.names)
+mat.cor.rand <- getPCor(df.all.rand, rand.genes.names, score.names)
+
+colnames(mat.cor.core) <- score.names
+rownames(mat.cor.core) <- gene.names
+
+df.cor.core <- as.data.frame(mat.cor.core)
+colnames(mat.cor.core) <- score.names
+
+colnames(mat.cor.rand) <- score.names
+rownames(mat.cor.rand) <- rand.genes.names
+
+df.cor.rand <- as.data.frame(mat.cor.rand)
+colnames(mat.cor.rand) <- score.names
+
+
+```
+
+
+```{r correlation heatmap}
+
+# get core CTL categorties (to annotated heatmap)
+df.coreCTL <- read.csv("core_categories.txt", 
+                        sep = "\t", header = T, stringsAsFactors = F)
+df.sup <- data.frame(genes = df.coreCTL$Supp, category = "Suppressor", color = 1)
+df.sens <- data.frame(genes = df.coreCTL$Synth, category = "Sensitizer", color = 2)
+df.both <- data.frame(genes = df.coreCTL$Supp.Synth, category = "Both", color = 3)
+df.coreMap <- bind_rows(df.sup, df.sens, df.both)
+df.coreMap <- df.coreMap[!(df.coreMap$genes == ""), ]
+df.coreMap$genes <- toupper(df.coreMap$genes)
+df.coreMap <- unique(df.coreMap)
+
+# get in vivo core CTL categories (to annotated heatmap)
+use.invivo.ctl <- F
+if (use.invivo.ctl){
+  df.coreCTL.invivo <- read.delim("invivo_ctl_genes_120420.txt", header = T,   "\t")
+  df.sup <- data.frame(genes = df.coreCTL.invivo$Gene[df.coreCTL.invivo$inVivo.class == "Suppressor"], category = "Suppressor", color = 1)
+  df.sens <- data.frame(genes = df.coreCTL.invivo$Gene[df.coreCTL.invivo$inVivo.class == "Sensitizer"], category = "Sensitizer", color = 2)
+  df.both <- data.frame(genes = df.coreCTL.invivo$Gene[df.coreCTL.invivo$inVivo.class == "No Effect"], category = "Other", color = 3)
+  df.coreMap <- bind_rows(df.sup, df.sens, df.both)
+  df.coreMap <- df.coreMap[!(df.coreMap$genes == ""), ]
+  df.coreMap$genes <- toupper(df.coreMap$genes)
+  df.coreMap <- unique(df.coreMap)
+}
+
+plot.scoreCorrelations.heatmap <- T
+
+if (plot.scoreCorrelations.heatmap){
+  
+  mat.cor.core <- t(as.matrix(df.cor.core))
+  mat.cor.rand <- t(as.matrix(df.cor.rand))
+  
+  # assign colors to coreCTL groups
+  col1 <- c("#0000FF","#FFFF00","#A9A9A9")
+  df.mapGenes <- data.frame(genes = colnames(mat.cor.core))
+  df.mapGenes$col <- 3
+  df.mapGenes$col[df.mapGenes$genes %in% df.coreMap$genes[df.coreMap$category == "Sensitizer"]] <- 1
+  df.mapGenes$col[df.mapGenes$genes %in% df.coreMap$genes[df.coreMap$category == "Suppressor"]] <- 2
+  
+  hmcol <- colorRampPalette(brewer.pal(9, "RdBu"))(100)
+  
+  heat.object.core <- scMiko::getHeat(mat.cor.core, hmcol, max(abs(mat.cor.core)), ColSideColors = col1[df.mapGenes$col], cexCol=0.5)
+
+}
+
+```
+
+
+```{r compare correlation coefficients, fig.width = 10, fig.height=6}
+
+# specify which gene sets
+df.cor.core$gene.set <- "core"
+df.cor.rand$gene.set <- "random"
+
+# get gene names
+df.cor.core$genes <- rownames(df.cor.core)
+df.cor.rand$genes <- rownames(df.cor.rand)
+
+# combine and reshape
+df.cor.all <- bind_rows(df.cor.core, df.cor.rand)
+df.cor.long <- pivot_longer(df.cor.all, cols = (score.names))
+
+# specify which ctl type
+  # df.cor.long$ctl.type <- "other"
+  df.cor.long$ctl.type[df.cor.long$genes %in% df.coreMap$genes[df.coreMap$category == "Both"]] <- "Both"
+  df.cor.long$ctl.type[df.cor.long$genes %in% df.coreMap$genes[df.coreMap$category == "Sensitizer"]] <- "Sensitizer"
+  df.cor.long$ctl.type[df.cor.long$genes %in% df.coreMap$genes[df.coreMap$category == "Suppressor"]] <- "Suppressor"
+  
+  df.cor.long$ctl.geneset <- paste(df.cor.long$gene.set, "-", df.cor.long$ctl.type, sep = "")
+  df.cor.long$ctl.geneset[grepl("random", df.cor.long$ctl.geneset)] <- "random"
+  
+  # add filter
+  df.cor.long <- df.cor.long[df.cor.long$ctl.geneset %in% c("random", "core-Sensitizer"), ]
+  df.cor.all <- df.cor.all[df.cor.all$genes %in% df.cor.long$genes, ]
+
+u.signatures <- as.character(unique(df.cor.long$name))
+
+p.val.cor <- c()
+for (i in 1:length(u.signatures)){
+  x <- df.cor.all[as.character(df.cor.all$gene.set) == "random" ,u.signatures[i]]
+  y <- df.cor.all[as.character(df.cor.all$gene.set) == "core"  ,u.signatures[i]]
+  p.val.cor[u.signatures[i]] <- wilcox.test(y,x)[["p.value"]]
+}
+
+df.p <- data.frame(sig = names(p.val.cor), pVal = as.vector(p.val.cor))
+df.p$pVal <- p.adjust(df.p$pVal, method = "BH")
+
+df.cor.long$name <- factor(df.cor.long$name, levels = c("Lymphocyte.Infiltration.Signature.Score", "cytolytic.index", "Lymphocytes", "T.Cells.CD8", "IFN.gamma.Response", "Leukocyte.Fraction", "IPRES", "hERV"))
+df.p$sig <- factor(df.p$sig, levels = c("Lymphocyte.Infiltration.Signature.Score", "cytolytic.index", "Lymphocytes", "T.Cells.CD8", "IFN.gamma.Response", "Leukocyte.Fraction", "IPRES", "hERV"))
+df.p$labels <- paste0( as.character(df.p$sig), "\n", signif(df.p$pVal, 3))
+df.p$labels <- factor(df.p$labels, levels = df.p$labels)
+df.cor.long$gene.set <- factor(df.cor.long$gene.set, levels = c("random", "core"))
+
+df.cor.long %>%
+  ggplot(aes(x = name, y = value, fill = gene.set)) + 
+  geom_boxplot(alpha = 0.5, size = 0.5, outlier.shape = NA) +
+  theme_classic() + 
+  ylab("Spearman Correlation") + 
+  xlab("Immune Signature") + 
+  geom_jitter(shape=16, alpha = 0.5, size = 1, position=position_jitterdodge(0.05)) + 
+  geom_hline(yintercept = 0, linetype = "dashed") +  
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+  scale_fill_manual(values=c("#999999", "tomato")) + 
+     scale_x_discrete(labels=df.p$labels[order(df.p$sig)]) + 
+  ggtitle("Random vs. Core Sensitizers")
+
+df.cor.long$ctl.geneset <- factor(df.cor.long$ctl.geneset, levels =c("random", "core-Sensitizer", "core-Suppressor"))
+df.cor.long %>%
+  ggplot(aes(x = name, y = value, fill = ctl.geneset)) + 
+  geom_boxplot(alpha = 1, size = 0.5, outlier.shape = NA) +
+  theme_classic() + 
+  ylab("Spearman Correlation") + 
+  xlab("Immune Signature") + 
+  geom_jitter(shape=16, alpha = 0.5, size = 1, position=position_jitterdodge(0.05)) + 
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+scale_fill_manual(name = "Classification", values = c("#A9A9A9", "#0000FF", "#FFFF00")) 
+
+
+```
+
